@@ -2,146 +2,100 @@
 # -*- coding: utf-8 -*-
 """
 =========================================================================
- B.I.C.H.O. - Backend Simulado / Gemelo Digital   |   UDD Tunnel Lab
+ B.I.C.H.O. - Controlador Supervisor / Gemelo Digital   |   UDD Tunnel Lab
 =========================================================================
-Gemelo digital de la tuneladora a escala funcional del equipo UDD Tunnel
-Lab para la Not-a-Boring Competition (The Boring Company).
+Controlador supervisor de la tuneladora a escala del equipo UDD Tunnel Lab
+para la Not-a-Boring Competition (The Boring Company, TBC).
 
-Implementa:
-  * Maquina de estados segura: POWER OFF / E-STOPPED / IDLE / READY /
-    MINING / FAULT, con transiciones validadas (nunca se pasa de un
-    estado inseguro directamente a excavar).
-  * Reinicio seguro (Safe Restart): salir de E-STOPPED, POWER OFF o
-    FAULT exige SIEMPRE 2 acciones independientes.
-  * Interlocks automaticos: sobrecarga del cabezal de corte, baja
-    presion de vejiga, sobrepresion de vejiga y perdida de red.
-  * Navegacion 6DOF (easting, northing, elevation, roll, pitch,
-    heading) integrada matematicamente solo mientras se excava.
-  * API REST local:  GET /telemetry   POST /command   POST /tbc_endpoint
-    POST /api/plc/parada (puente de parada de emergencia hacia el PLC).
-  * En E-STOPPED / FAULT los actuadores van a 0; presiones, 6DOF y sensores
-    siguen calculandose y publicandose (el servidor no se detiene).
-  * Sensor inalambrico de vejiga + ruido blanco para probar filtros.
-  * Uplink opcional de telemetria por HTTP POST. Lazo fisico y telemetria a 10 Hz.
+Arquitectura (Clean Architecture + Inversion de Dependencias, PRD v2.0):
 
-Solo libreria estandar de Python 3.
+    +-------------------------------------------------------------------+
+    | CAPA 4  PRESENTACION / API   aiohttp: GET /telemetry, POST        |
+    |         /command, POST /api/plc/parada + cliente POST hacia TBC   |
+    +----------------------------+--------------------------------------+
+                                 | depende de
+    +----------------------------v--------------------------------------+
+    | CAPA 3  NUCLEO / DOMINIO     TBMController: maquina de estados,   |
+    |         interlocks PDB 5.6, Safe Restart, watchdog, lazo 10 Hz    |
+    +----------------------------+--------------------------------------+
+                                 | depende de (abstraccion)
+    +----------------------------v--------------------------------------+
+    | CAPA 1  PUERTOS              IHardwareAdapter (contrato)          |
+    +----------------------------^--------------------------------------+
+                                 | implementa
+    +----------------------------+--------------------------------------+
+    | CAPA 2  ADAPTADORES          SimulatedHardwareAdapter (planta     |
+    |         simulada: ruido blanco, 6DOF, sensor de vejiga)           |
+    +-------------------------------------------------------------------+
+
+    Regla de dependencias: Presentacion -> Nucleo -> Puertos <- Adaptadores.
+    El nucleo NUNCA importa un adaptador concreto: recibe el hardware por
+    inyeccion de dependencias en `main()` (raiz de composicion). Cambiar de
+    simulador a un PLC Siemens / servos SEW = escribir otra clase que herede
+    de `IHardwareAdapter` y pasarla al `TBMController`; nada mas cambia.
+
+Seguridad (reglamento TBC y PDB del equipo):
+  * Estados: POWER OFF / E-STOPPED / IDLE / READY / MINING / FAULT con
+    transiciones validadas (nunca se pasa de un estado inseguro a excavar).
+  * Safe Restart (TBC 10.g): salir de E-STOPPED, POWER OFF o FAULT exige
+    SIEMPRE 2 acciones operador independientes y en orden.
+  * Interlocks (PDB 5.6): sobrecarga del cabezal, sobrecarga de la
+    propulsion, sobrepresion de vejiga (alivio), perdida de presion de
+    vejiga, sensor inalambrico de vejiga y perdida de red.
+  * Modos de mando (PDB 6.6.2): ningun comando manual puede saltarse un
+    interlock; la compuerta de seguridad se aplica en la etapa de salida.
+  * Watchdog de red de 10 s: un enlace armado sin vida > 10 s => FAULT.
+  * E-Stop: actuadores a 0 de inmediato, pero `read_sensors()` se sigue
+    llamando a 10 Hz y la telemetria sigue viva.
+  * Cliente TBC (Regla 7): POST de la telemetria a >= 0.1 Hz en segundo plano.
+
+Dependencia externa unica: aiohttp  ->  pip install -r requirements.txt
 
 Uso:
     python simulador_bicho.py
     python simulador_bicho.py --port 8000 --start-state IDLE
-    python simulador_bicho.py --uplink-url http://localhost:8000/tbc_endpoint
+    python simulador_bicho.py --uplink-url https://servidor-tbc/endpoint --uplink-hz 0.5
 """
 
+from __future__ import annotations
+
 import argparse
-import copy
+import asyncio
 import json
 import math
 import random
 import sys
-import threading
 import time
-import urllib.error
-import urllib.request
+from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from enum import Enum
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from typing import Mapping, Optional
+
+try:                                   # Solo la capa de presentacion lo usa.
+    import aiohttp
+    from aiohttp import web
+except ImportError:                    # pragma: no cover
+    aiohttp = None
+    web = None
+
 
 # =========================================================================
-# 1. CONFIGURACION Y CONSTANTES FISICAS
+# 0. NUCLEO COMPARTIDO (identidad, especificacion de la maquina, logging)
+#    Sin dependencias hacia ninguna capa: lo pueden usar todas.
 # =========================================================================
 
 TEAM_NAME = "UDD Tunnel Lab"
-VERSION = "2.1"
+VERSION = "3.0"
 
-TICK_HZ = 10.0                      # frecuencia base: 10 lecturas por segundo
+TICK_HZ = 10.0                      # lazo de control y muestreo: 10 Hz
 TICK_PERIOD_S = 1.0 / TICK_HZ
 DEFAULT_PORT = 8000
 
-# --- Cabezal de corte (cutterhead) ---
+# Limites nominales de la maquina (los comparten nucleo y planta).
 CUTTERHEAD_RPM_MAX = 8.0
-CUTTERHEAD_RPM_DEFAULT = 3.5
-CUTTERHEAD_RPM_MIN_MINING = 1.0     # rpm minimas para autorizar MINING
-CUTTERHEAD_RPM_RAMP = 1.2           # rpm/s acelerando
-CUTTERHEAD_RPM_BRAKE = 3.0          # rpm/s frenando
-CUTTERHEAD_LOAD_MAX_PCT = 100.0     # umbral de sobrecarga
-CUTTERHEAD_CURRENT_MAX_A = 32.0     # umbral de sobrecorriente
-CUTTERHEAD_AMPS_PER_PCT = 0.32
-CUTTERHEAD_TORQUE_MAX_NM = 900.0
-OVERLOAD_DEBOUNCE_S = 1.5           # antirebote del interlock de sobrecarga
-
-# --- Vejiga de propulsion (bladder) ---
-BLADDER_P_MIN = 1.20                # bar - por debajo se inhibe la propulsion
-BLADDER_P_MAX = 3.00                # bar - por encima: alivio + inhibicion
-BLADDER_P_TARGET_DEFAULT = 1.80
-BLADDER_P_TARGET_MAX = 2.60
-BLADDER_INFLATE_RATE = 0.40         # bar/s de inflado
-BLADDER_LEAK_RATE = 0.015           # bar/s de fuga normal
-BLADDER_LEAK_FAULT_RATE = 0.55      # bar/s de fuga simulada (falla inyectada)
-BLADDER_PUMP_STUCK_RATE = 0.50      # bar/s con bomba trabada (falla inyectada)
-BLADDER_RELIEF_RATE = 0.90          # bar/s de la valvula de alivio
-BLADDER_RELIEF_HYST = 0.25          # bar de histeresis para cerrar el alivio
-BLADDER_GRIP_GRACE_S = 6.0          # margen de inflado antes de armar el interlock de baja presion
-
-# --- Propulsion tipo oruga ---
 PROPULSION_SPEED_MAX = 60.0         # mm/min
-PROPULSION_SPEED_DEFAULT = 42.0     # mm/min
-PROPULSION_RAMP = 12.0              # mm/min por segundo
-
-# --- Motores de direccion A (guiñada) y B (cabeceo) ---
 STEER_STROKE_MM = 25.0              # recorrido +/- respecto al centro
-STEER_RATE_MM_S = 2.0
-STEER_YAW_DEG_PER_M = 0.060         # grados de guiñada por mm de A y metro avanzado
-STEER_PITCH_DEG_PER_M = 0.040       # grados de cabeceo por mm de B y metro avanzado
-PITCH_LIMIT_DEG = 8.0
 
-# --- Hydroshield (presion de soporte del frente) ---
-HYDROSHIELD_IDLE_BAR = 1.90
-HYDROSHIELD_MINING_BAR = 2.45
-
-# --- Comunicaciones ---
-COMMS_TIMEOUT_S = 15.0              # > 10 s (0.1 Hz) para no dar falsos positivos
-UPLINK_MAX_FAILURES = 3
-
-# --- Sensor inalambrico de vejiga ---
-BLADDER_SENSOR_BATTERY_START = 100.0
-BLADDER_SENSOR_BATTERY_CRITICAL_PCT = 10.0
-BLADDER_SENSOR_DRAIN_PCT_PER_H = 0.8        # descarga nominal (horas de autonomia)
-BLADDER_SENSOR_DRAIN_FAULT_PCT_S = 6.0      # descarga acelerada para pruebas
-BLADDER_SENSOR_SIGNAL_BASE_MS = 18.0
-BLADDER_SENSOR_SIGNAL_LOST_MS = 250.0       # umbral de perdida de enlace
-BLADDER_SENSOR_SIGNAL_TIMEOUT_MS = 999.0    # valor publicado cuando no hay enlace
-
-# --- Ruido blanco de sensores (1-sigma) para probar filtros ---
-NOISE_PRESSURE_BAR = 0.012
-NOISE_POSE_M = 0.004
-NOISE_ATTITUDE_DEG = 0.035
-NOISE_TEMP_C = 0.08
-NOISE_LOAD_PCT = 0.35
-NOISE_CURRENT_A = 0.08
-NOISE_SIGNAL_MS = 2.4
-NOISE_BATTERY_PCT = 0.04
-
-# --- Termico ---
-AMBIENT_TEMP_C = 24.0
-
-# --- Punto de partida georreferenciado (UTM) ---
-START_CHAINAGE_M = 12.450
-START_EASTING_M = 342118.640
-START_NORTHING_M = 6296004.210
-START_ELEVATION_M = -42.180
-START_ROLL_DEG = 0.620
-START_PITCH_DEG = -1.180
-START_HEADING_DEG = 118.440
-
-# --- Subsistemas inhabilitables por interlock ---
-SUB_CUTTERHEAD = "cutterhead"
-SUB_PROPULSION = "propulsion"
-SUB_INFLATION = "inflation"
-SUB_STEERING = "steering"
-
-
-# =========================================================================
-# 2. UTILIDADES Y LOGGING
-# =========================================================================
 
 def clamp(value, low, high):
     """Acota un valor al rango [low, high]."""
@@ -190,8 +144,754 @@ def configure_console():
 
 
 # =========================================================================
-# 3. MAQUINA DE ESTADOS: DEFINICION
+# CAPA 1 - PUERTOS (interfaces hacia el hardware)
 # =========================================================================
+# Contrato de datos entre el nucleo y cualquier hardware. Un adaptador real
+# (PLC Siemens, servos SEW, ...) debe entregar y aceptar exactamente estas
+# claves; el nucleo las valida en cada ciclo.
+
+SENSOR_KEYS = (
+    # --- Navegacion 6DOF medida (puede traer ruido) + odometria ---
+    "chainage_m", "easting_m", "northing_m", "elevation_m",
+    "roll_deg", "pitch_deg", "heading_deg",
+    "chainage_odometry_m",          # avance integrado por encoders de oruga
+    "yaw_rate_deg_s",
+    "ground_hardness_index",
+    # --- Cabezal de corte ---
+    "cutterhead_rpm", "cutterhead_load_pct", "cutterhead_current_a",
+    "cutterhead_torque_nm", "cutterhead_temp_c",
+    # --- Propulsion tipo oruga ---
+    "propulsion_speed_mm_min", "track_left_mm_min", "track_right_mm_min",
+    "thrust_force_kn", "propulsion_load_pct", "propulsion_current_a",
+    "propulsion_temp_c",
+    # --- Vejiga e hydroshield ---
+    "bladder_pressure_bar", "hydroshield_pressure_bar",
+    # --- Motores de direccion A (guiñada) y B (cabeceo) ---
+    "steer_a_mm", "steer_b_mm",
+    # --- Sensor inalambrico de presion de vejiga ---
+    "bladder_sensor_battery_pct", "bladder_sensor_signal_ms",
+    "bladder_sensor_link_ok",
+)
+
+ACTUATOR_KEYS = (
+    "safe_torque_off",                  # True => corte inmediato de accionamientos
+    "main_power",                       # False => planta sin energia
+    "advance_enabled",                  # autorizacion de avance (solo en MINING)
+    "cutterhead_rpm_setpoint",
+    "propulsion_speed_setpoint_mm_min",
+    "bladder_inflate_enable",
+    "bladder_pressure_setpoint_bar",
+    "relief_valve_open",
+    "steer_a_setpoint_mm",
+    "steer_b_setpoint_mm",
+    "hydroshield_setpoint_bar",
+)
+
+
+def safe_actuator_commands():
+    """Comandos de estado seguro: sin movimiento, sin energia de accionamientos."""
+    return {
+        "safe_torque_off": True,
+        "main_power": False,
+        "advance_enabled": False,
+        "cutterhead_rpm_setpoint": 0.0,
+        "propulsion_speed_setpoint_mm_min": 0.0,
+        "bladder_inflate_enable": False,
+        "bladder_pressure_setpoint_bar": 0.0,
+        "relief_valve_open": False,
+        "steer_a_setpoint_mm": 0.0,
+        "steer_b_setpoint_mm": 0.0,
+        "hydroshield_setpoint_bar": 0.0,
+    }
+
+
+class HardwareError(RuntimeError):
+    """Error de E/S entre el nucleo y el hardware (contrato violado o enlace roto)."""
+
+
+class IHardwareAdapter(ABC):
+    """Puerto de hardware: contrato que todo hardware debe cumplir.
+
+    El nucleo (`TBMController`) solo conoce esta interfaz. El hardware se
+    trata como una "caja negra" intercambiable.
+
+    Reglas del contrato:
+      * Los 4 metodos deben ser NO BLOQUEANTES (sub-milisegundo): el lazo de
+        control corre a 10 Hz dentro del event loop. Un adaptador con E/S
+        bloqueante (Modbus, S7, CAN...) debe tener su propio hilo de sondeo
+        y devolver aqui el ultimo valor cacheado.
+      * `read_sensors()` devuelve un dict con TODAS las claves de
+        `SENSOR_KEYS`; `write_actuators()` recibe TODAS las de `ACTUATOR_KEYS`.
+      * Cualquier excepcion se interpreta como perdida de enlace con el
+        hardware y el nucleo pasa a estado seguro.
+    """
+
+    @abstractmethod
+    def read_sensors(self) -> dict:
+        """Lee los sensores (claves `SENSOR_KEYS`)."""
+
+    @abstractmethod
+    def write_actuators(self, commands: dict) -> None:
+        """Escribe las consignas de actuadores (claves `ACTUATOR_KEYS`)."""
+
+    @abstractmethod
+    def check_network_health(self) -> bool:
+        """True si la red/bus de campo con el hardware esta sana."""
+
+    @abstractmethod
+    def is_hardware_estop_triggered(self) -> bool:
+        """True mientras el hongo de emergencia FISICO este presionado."""
+
+
+class IFaultInjectionPort(ABC):
+    """Puerto opcional (segregacion de interfaces) solo para hardware simulado.
+
+    Permite inyectar fallas de prueba desde `POST /command`. Un adaptador de
+    hardware real NO lo implementa y el nucleo rechaza esos comandos.
+    """
+
+    @abstractmethod
+    def available_faults(self) -> list:
+        """Nombres de las fallas inyectables."""
+
+    @abstractmethod
+    def inject_fault(self, fault: str, params: Mapping) -> tuple:
+        """Inyecta una falla. Devuelve (ok, mensaje)."""
+
+    @abstractmethod
+    def clear_injected_faults(self) -> None:
+        """Retira todas las fallas inyectadas y restaura el sensor inalambrico."""
+
+    @abstractmethod
+    def injected_faults(self) -> list:
+        """Nombres de las fallas actualmente inyectadas."""
+
+    @abstractmethod
+    def set_wireless_sensor(self, params: Mapping) -> tuple:
+        """Ajusta bateria/señal del sensor inalambrico. Devuelve (ok, mensaje)."""
+
+    @abstractmethod
+    def set_hardware_estop(self, pressed: bool) -> None:
+        """Presiona o libera el hongo de emergencia fisico simulado."""
+
+
+# =========================================================================
+# CAPA 2 - ADAPTADORES (hardware simulado)
+# =========================================================================
+# Todo lo "fisico" vive aqui: dinamica de actuadores, ruido blanco, evolucion
+# 6DOF, termica, terreno y degradacion del sensor inalambrico de vejiga.
+# Esta capa solo depende del puerto: no sabe nada de estados ni interlocks.
+
+# --- Cabezal de corte ---
+CUTTERHEAD_RPM_RAMP = 1.2           # rpm/s acelerando
+CUTTERHEAD_RPM_BRAKE = 3.0          # rpm/s frenando
+CUTTERHEAD_AMPS_PER_PCT = 0.32
+CUTTERHEAD_TORQUE_MAX_NM = 900.0
+CUTTERHEAD_FAULT_LOAD_PCT = 55.0    # carga extra de la falla inyectada
+
+# --- Propulsion tipo oruga ---
+PROPULSION_RAMP = 12.0              # mm/min por segundo
+PROPULSION_AMPS_PER_PCT = 0.24
+PROPULSION_FAULT_LOAD_PCT = 45.0    # carga extra de la falla inyectada
+
+# --- Vejiga de propulsion ---
+BLADDER_INFLATE_RATE = 0.40         # bar/s de inflado
+BLADDER_LEAK_RATE = 0.015           # bar/s de fuga normal
+BLADDER_LEAK_FAULT_RATE = 0.55      # bar/s de fuga simulada (falla inyectada)
+BLADDER_PUMP_STUCK_RATE = 0.50      # bar/s con bomba trabada (falla inyectada)
+BLADDER_RELIEF_RATE = 0.90          # bar/s de la valvula de alivio
+BLADDER_UNPOWERED_LEAK_RATE = 0.10  # bar/s: sin energia la vejiga se despresuriza
+
+# --- Motores de direccion A (guiñada) y B (cabeceo) ---
+STEER_RATE_MM_S = 2.0
+STEER_YAW_DEG_PER_M = 0.060         # grados de guiñada por mm de A y metro avanzado
+STEER_PITCH_DEG_PER_M = 0.040       # grados de cabeceo por mm de B y metro avanzado
+PITCH_LIMIT_DEG = 8.0
+
+# --- Sensor inalambrico de vejiga ---
+BLADDER_SENSOR_BATTERY_START = 100.0
+BLADDER_SENSOR_DRAIN_PCT_PER_H = 0.8        # descarga nominal (horas de autonomia)
+BLADDER_SENSOR_DRAIN_FAULT_PCT_S = 6.0      # descarga acelerada para pruebas
+BLADDER_SENSOR_SIGNAL_BASE_MS = 18.0
+BLADDER_SENSOR_LINK_LOSS_MS = 250.0         # el radio da el enlace por perdido
+BLADDER_SENSOR_SIGNAL_TIMEOUT_MS = 999.0    # valor publicado cuando no hay enlace
+
+# --- Ruido blanco de sensores (1-sigma) para probar filtros ---
+NOISE_PRESSURE_BAR = 0.012
+NOISE_POSE_M = 0.004
+NOISE_ATTITUDE_DEG = 0.035
+NOISE_TEMP_C = 0.08
+NOISE_LOAD_PCT = 0.35
+NOISE_CURRENT_A = 0.08
+NOISE_SIGNAL_MS = 2.4
+NOISE_BATTERY_PCT = 0.04
+
+# --- Termico ---
+AMBIENT_TEMP_C = 24.0
+
+# --- Punto de partida georreferenciado (UTM) ---
+START_CHAINAGE_M = 12.450
+START_EASTING_M = 342118.640
+START_NORTHING_M = 6296004.210
+START_ELEVATION_M = -42.180
+START_ROLL_DEG = 0.620
+START_PITCH_DEG = -1.180
+START_HEADING_DEG = 118.440
+
+# --- Integracion numerica ---
+MAX_PHYSICS_STEP_S = 0.1            # paso maximo de integracion
+MAX_CATCHUP_S = 0.5                 # tope de tiempo a recuperar en una lectura
+
+# Alias de las fallas inyectables -> nombre canonico.
+FAULT_ALIASES = {
+    "overload": "cutterhead_overload",
+    "cutterhead": "cutterhead_overload",
+    "cutterhead_overload": "cutterhead_overload",
+    "propulsion": "propulsion_overload",
+    "propulsion_overload": "propulsion_overload",
+    "underpressure": "bladder_underpressure",
+    "leak": "bladder_underpressure",
+    "bladder_underpressure": "bladder_underpressure",
+    "overpressure": "bladder_overpressure",
+    "bladder_overpressure": "bladder_overpressure",
+    "comms": "comms_loss",
+    "network": "comms_loss",
+    "comms_loss": "comms_loss",
+    "wireless": "bladder_sensor",
+    "bladder_sensor": "bladder_sensor",
+    "sensor": "bladder_sensor",
+    "battery": "bladder_sensor_battery",
+    "bladder_sensor_battery": "bladder_sensor_battery",
+    "signal": "bladder_sensor_signal",
+    "bladder_sensor_signal": "bladder_sensor_signal",
+    "hardware_estop": "hardware_estop",
+    "hw_estop": "hardware_estop",
+}
+
+
+class SimulatedHardwareAdapter(IHardwareAdapter, IFaultInjectionPort):
+    """Hardware simulado para desarrollo y pruebas.
+
+    Es una planta autonoma: avanza su propia fisica con el reloj cada vez
+    que se leen los sensores (como lo haria un proceso real), obedece las
+    consignas de `write_actuators()` y entrega lecturas con ruido blanco.
+    """
+
+    name = "SimulatedHardwareAdapter"
+
+    def __init__(self, *, rng=None, clock=time.monotonic):
+        self._rng = rng if rng is not None else random.Random()
+        self._clock = clock
+        self._last_t = clock()
+        self._sim_time = 0.0
+
+        # --- Navegacion 6DOF (verdad fisica) ---
+        self._chainage = START_CHAINAGE_M
+        self._easting = START_EASTING_M
+        self._northing = START_NORTHING_M
+        self._elevation = START_ELEVATION_M
+        self._roll = START_ROLL_DEG
+        self._pitch = START_PITCH_DEG
+        self._heading = START_HEADING_DEG
+        self._yaw_rate = 0.0
+        self._vib_roll = 0.0
+        self._vib_pitch = 0.0
+        self._vib_phase = 0.0
+
+        # --- Terreno ---
+        self._ground_hardness = 1.0
+        self._ground_phase = 0.0
+        self._ground_walk = 0.0
+
+        # --- Cabezal de corte ---
+        self._ch_rpm = 0.0
+        self._ch_load = 0.0
+        self._ch_current = 0.0
+        self._ch_torque = 0.0
+        self._ch_temp = AMBIENT_TEMP_C
+
+        # --- Propulsion ---
+        self._prop_speed = 0.0
+        self._track_left = 0.0
+        self._track_right = 0.0
+        self._thrust = 0.0
+        self._prop_load = 0.0
+        self._prop_current = 0.0
+        self._prop_temp = AMBIENT_TEMP_C
+
+        # --- Vejiga, hydroshield y direccion ---
+        self._bladder_p = 0.0
+        self._hydro_p = 0.0
+        self._steer_a = 0.0
+        self._steer_b = 0.0
+
+        # --- Sensor inalambrico de vejiga (verdad fisica) ---
+        self._bs_battery = BLADDER_SENSOR_BATTERY_START
+        self._bs_signal_ms = BLADDER_SENSOR_SIGNAL_BASE_MS
+        self._bs_link_ok = True
+
+        # --- Fallas inyectadas y hongo fisico ---
+        self._faults = set()
+        self._hw_estop = False
+
+        # Ultima consigna recibida (estado seguro hasta que el nucleo escriba).
+        self._cmd = safe_actuator_commands()
+
+    # -------------------------------------------------------------------
+    # Contrato IHardwareAdapter
+    # -------------------------------------------------------------------
+
+    def read_sensors(self):
+        self._advance_to_now()
+        m = self._measure
+        link_ok = self._bs_link_ok
+        return {
+            # Navegacion medida (con ruido blanco)
+            "chainage_m": m(self._chainage, NOISE_POSE_M),
+            "easting_m": m(self._easting, NOISE_POSE_M),
+            "northing_m": m(self._northing, NOISE_POSE_M),
+            "elevation_m": m(self._elevation, NOISE_POSE_M),
+            "roll_deg": m(self._roll + self._vib_roll, NOISE_ATTITUDE_DEG),
+            "pitch_deg": m(self._pitch + self._vib_pitch, NOISE_ATTITUDE_DEG),
+            "heading_deg": m(self._heading, NOISE_ATTITUDE_DEG) % 360.0,
+            # Variables sin ruido (encoders / calculadas)
+            "chainage_odometry_m": self._chainage,
+            "yaw_rate_deg_s": self._yaw_rate,
+            "ground_hardness_index": self._ground_hardness,
+            # Cabezal de corte
+            "cutterhead_rpm": self._ch_rpm,
+            "cutterhead_load_pct": m(self._ch_load, NOISE_LOAD_PCT, 0.0),
+            "cutterhead_current_a": m(self._ch_current, NOISE_CURRENT_A, 0.0),
+            "cutterhead_torque_nm": self._ch_torque,
+            "cutterhead_temp_c": m(self._ch_temp, NOISE_TEMP_C),
+            # Propulsion
+            "propulsion_speed_mm_min": self._prop_speed,
+            "track_left_mm_min": self._track_left,
+            "track_right_mm_min": self._track_right,
+            "thrust_force_kn": self._thrust,
+            "propulsion_load_pct": m(self._prop_load, NOISE_LOAD_PCT, 0.0),
+            "propulsion_current_a": m(self._prop_current, NOISE_CURRENT_A, 0.0),
+            "propulsion_temp_c": m(self._prop_temp, NOISE_TEMP_C),
+            # Presiones
+            "bladder_pressure_bar": m(self._bladder_p, NOISE_PRESSURE_BAR, 0.0),
+            "hydroshield_pressure_bar": m(self._hydro_p, NOISE_PRESSURE_BAR, 0.0),
+            # Direccion
+            "steer_a_mm": self._steer_a,
+            "steer_b_mm": self._steer_b,
+            # Sensor inalambrico de vejiga
+            "bladder_sensor_battery_pct": m(self._bs_battery, NOISE_BATTERY_PCT, 0.0, 100.0),
+            "bladder_sensor_signal_ms": (
+                m(self._bs_signal_ms, NOISE_SIGNAL_MS, 1.0)
+                if link_ok else BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
+            ),
+            "bladder_sensor_link_ok": link_ok,
+        }
+
+    def write_actuators(self, commands):
+        missing = [key for key in ACTUATOR_KEYS if key not in commands]
+        if missing:
+            raise HardwareError(f"write_actuators() sin las claves {missing}")
+        # Se integra la fisica con la consigna ANTERIOR hasta este instante
+        # y recien entonces entra la nueva (como un scan de PLC).
+        self._advance_to_now()
+        self._cmd = {key: commands[key] for key in ACTUATOR_KEYS}
+        if self._cmd["safe_torque_off"]:
+            # STO cableado: los accionamientos caen sin esperar al siguiente ciclo.
+            self._zero_drives()
+
+    def check_network_health(self):
+        return "comms_loss" not in self._faults
+
+    def is_hardware_estop_triggered(self):
+        return self._hw_estop
+
+    # -------------------------------------------------------------------
+    # Contrato IFaultInjectionPort
+    # -------------------------------------------------------------------
+
+    def available_faults(self):
+        return sorted(set(FAULT_ALIASES.values()))
+
+    def inject_fault(self, fault, params):
+        raw = str(fault).strip().lower()
+        canonical = FAULT_ALIASES.get(raw)
+        if canonical is None:
+            return False, (
+                f"Falla desconocida '{raw}'. Validas: "
+                f"{', '.join(self.available_faults())}, generic."
+            )
+
+        if canonical == "cutterhead_overload":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: sobrecarga en el cabezal de corte.")
+            note = "" if self._ch_rpm > 0 else " (se manifestara al arrancar el cabezal)"
+            return True, f"Sobrecarga inyectada; el interlock disparara solo{note}."
+
+        if canonical == "propulsion_overload":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: sobrecarga en el motor de propulsion.")
+            note = "" if self._prop_speed > 0 else " (se manifestara al avanzar)"
+            return True, f"Sobrecarga de propulsion inyectada; el interlock disparara solo{note}."
+
+        if canonical == "bladder_underpressure":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: fuga en la vejiga de propulsion.")
+            return True, "Fuga inyectada; la presion caera por debajo de P_min."
+
+        if canonical == "bladder_overpressure":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: valvula de inflado trabada (sobrepresion).")
+            return True, "Bomba trabada inyectada; la presion superara P_max."
+
+        if canonical == "comms_loss":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: perdida de comunicacion de red con el hardware.")
+            return True, (
+                "Perdida de red simulada; el watchdog ejecutara el aborto global "
+                "si no se recupera dentro de su ventana."
+            )
+
+        if canonical == "bladder_sensor_battery":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: descarga acelerada de bateria del sensor inalambrico.")
+            return True, "La bateria del sensor caera hasta el umbral critico y disparara FAULT."
+
+        if canonical == "bladder_sensor_signal":
+            self._faults.add(canonical)
+            log_interlock("Falla inyectada: perdida de enlace del sensor inalambrico de vejiga.")
+            return True, "Enlace del sensor perdido; el interlock llevara la maquina a FAULT."
+
+        if canonical == "bladder_sensor":
+            self._faults.add("bladder_sensor_signal")
+            log_interlock("Falla inyectada: sensor inalambrico de vejiga (enlace + bateria).")
+            return True, "Sensor inalambrico fuera de servicio; la maquina pasara a FAULT."
+
+        # hardware_estop
+        self.set_hardware_estop(True)
+        return True, "Hongo de emergencia FISICO presionado (simulado)."
+
+    def clear_injected_faults(self):
+        # El hongo fisico NO se libera aqui: solo se libera con set_hardware_estop(False).
+        self._faults.clear()
+        if self._bs_battery < 40.0:
+            self._bs_battery = BLADDER_SENSOR_BATTERY_START
+        self._bs_link_ok = True
+        self._bs_signal_ms = BLADDER_SENSOR_SIGNAL_BASE_MS
+
+    def injected_faults(self):
+        names = set(self._faults)
+        if self._hw_estop:
+            names.add("hardware_estop")
+        return sorted(names)
+
+    def set_wireless_sensor(self, params):
+        if "battery_percent" in params:
+            self._bs_battery = clamp(float(params["battery_percent"]), 0.0, 100.0)
+            self._faults.discard("bladder_sensor_battery")
+        if "signal_ms" in params:
+            self._bs_signal_ms = max(0.0, float(params["signal_ms"]))
+            lost = self._bs_signal_ms >= BLADDER_SENSOR_LINK_LOSS_MS
+            self._set_fault("bladder_sensor_signal", lost)
+            self._bs_link_ok = not lost
+        if "link_ok" in params:
+            lost = not bool(params["link_ok"])
+            self._set_fault("bladder_sensor_signal", lost)
+            self._bs_link_ok = not lost
+            if lost:
+                self._bs_signal_ms = BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
+        return True, (
+            f"Sensor inalambrico: bateria {self._bs_battery:.1f} %, "
+            f"señal {self._bs_signal_ms:.1f} ms, "
+            f"enlace={'ok' if self._bs_link_ok else 'perdido'}."
+        )
+
+    def set_hardware_estop(self, pressed):
+        self._hw_estop = bool(pressed)
+
+    def _set_fault(self, name, active):
+        if active:
+            self._faults.add(name)
+        else:
+            self._faults.discard(name)
+
+    # -------------------------------------------------------------------
+    # Medicion con ruido blanco
+    # -------------------------------------------------------------------
+
+    def _measure(self, truth, sigma, low=None, high=None):
+        """Lectura de sensor = verdad + ruido blanco (para probar filtros)."""
+        value = truth + (self._rng.gauss(0.0, sigma) if sigma > 0.0 else 0.0)
+        if low is not None:
+            value = max(low, value)
+        if high is not None:
+            value = min(high, value)
+        return value
+
+    # -------------------------------------------------------------------
+    # Fisica de la planta
+    # -------------------------------------------------------------------
+
+    def _advance_to_now(self):
+        """Integra la fisica hasta el instante actual (pasos de <= 100 ms)."""
+        now = self._clock()
+        elapsed = clamp(now - self._last_t, 0.0, MAX_CATCHUP_S)
+        self._last_t = now
+        if elapsed <= 1e-9:
+            return
+        substeps = max(1, math.ceil(elapsed / MAX_PHYSICS_STEP_S - 1e-9))
+        step = elapsed / substeps
+        for _ in range(substeps):
+            self._integrate(step)
+
+    def _integrate(self, dt):
+        self._sim_time += dt
+        self._update_ground(dt)
+        self._update_cutterhead(dt)
+        self._update_bladder(dt)
+        self._update_propulsion(dt)
+        self._update_steering(dt)
+        self._update_hydroshield(dt)
+        self._update_navigation(dt)
+        self._update_thermal(dt)
+        self._update_wireless_sensor(dt)
+
+    def _zero_drives(self):
+        """Corte inmediato de cabezal y orugas. No toca presiones ni pose 6DOF."""
+        self._ch_rpm = 0.0
+        self._ch_load = 0.0
+        self._ch_current = 0.0
+        self._ch_torque = 0.0
+        self._prop_speed = 0.0
+        self._track_left = 0.0
+        self._track_right = 0.0
+        self._prop_load = 0.0
+        self._prop_current = 0.0
+        self._yaw_rate = 0.0
+
+    def _update_ground(self, dt):
+        """Dureza del terreno: deriva lenta + caminata aleatoria acotada."""
+        self._ground_phase += dt * 0.05
+        self._ground_walk = clamp(
+            self._ground_walk + self._rng.uniform(-0.05, 0.05) * dt, -0.08, 0.08
+        )
+        self._ground_hardness = clamp(
+            1.0 + 0.10 * math.sin(self._ground_phase) + self._ground_walk, 0.82, 1.18
+        )
+
+    def _update_cutterhead(self, dt):
+        if self._cmd["safe_torque_off"]:
+            self._zero_drives()
+            return
+        target = self._cmd["cutterhead_rpm_setpoint"]
+
+        if self._ch_rpm < target:
+            self._ch_rpm = min(target, self._ch_rpm + CUTTERHEAD_RPM_RAMP * dt)
+        else:
+            self._ch_rpm = max(target, self._ch_rpm - CUTTERHEAD_RPM_BRAKE * dt)
+
+        if self._ch_rpm <= 0.01:
+            self._ch_rpm = 0.0
+            self._ch_load = 0.0
+            self._ch_current = 0.0
+            self._ch_torque = 0.0
+            return
+
+        # Carga = f(rpm, dureza del terreno, empuje aplicado)
+        load = 8.0 + 95.0 * (self._ch_rpm / CUTTERHEAD_RPM_MAX) * self._ground_hardness
+        if self._cmd["advance_enabled"] and self._prop_speed > 1.0:
+            load *= 1.0 + 0.55 * (self._prop_speed / PROPULSION_SPEED_MAX)
+        if "cutterhead_overload" in self._faults:
+            load += CUTTERHEAD_FAULT_LOAD_PCT
+        load += self._rng.uniform(-1.5, 1.5)
+
+        self._ch_load = max(0.0, load)
+        self._ch_current = max(
+            0.0, self._ch_load * CUTTERHEAD_AMPS_PER_PCT + self._rng.uniform(-0.25, 0.25)
+        )
+        self._ch_torque = CUTTERHEAD_TORQUE_MAX_NM * self._ch_load / 100.0
+
+    def _update_bladder(self, dt):
+        cmd = self._cmd
+        inflate_ok = cmd["bladder_inflate_enable"]
+        pressure = self._bladder_p
+
+        if "bladder_overpressure" in self._faults:
+            # Valvula de inflado trabada: sube ignorando la consigna.
+            pressure += BLADDER_PUMP_STUCK_RATE * dt
+        elif inflate_ok and cmd["bladder_pressure_setpoint_bar"] > 0.0:
+            error = cmd["bladder_pressure_setpoint_bar"] - pressure
+            if error > 0.0:
+                pressure += min(BLADDER_INFLATE_RATE, error * 2.5) * dt
+            elif error < -0.05:
+                pressure -= min(BLADDER_INFLATE_RATE, -error * 2.0) * dt
+
+        pressure -= BLADDER_LEAK_RATE * dt
+        if "bladder_underpressure" in self._faults:
+            pressure -= BLADDER_LEAK_FAULT_RATE * dt
+        if cmd["relief_valve_open"]:
+            pressure -= BLADDER_RELIEF_RATE * dt
+        if not cmd["main_power"] and "bladder_overpressure" not in self._faults:
+            pressure -= BLADDER_UNPOWERED_LEAK_RATE * dt   # sin energia se despresuriza
+
+        self._bladder_p = max(0.0, pressure)
+
+    def _update_propulsion(self, dt):
+        if self._cmd["safe_torque_off"]:
+            self._zero_drives()
+        else:
+            target = self._cmd["propulsion_speed_setpoint_mm_min"]
+            if self._prop_speed < target:
+                self._prop_speed = min(target, self._prop_speed + PROPULSION_RAMP * dt)
+            else:
+                self._prop_speed = max(target, self._prop_speed - PROPULSION_RAMP * dt)
+            if self._prop_speed < 0.05:
+                self._prop_speed = 0.0
+
+        # Orugas de propulsion: el motor A introduce un diferencial de velocidad.
+        differential = self._steer_a / STEER_STROKE_MM
+        self._track_left = self._prop_speed * (1.0 + 0.25 * differential)
+        self._track_right = self._prop_speed * (1.0 - 0.25 * differential)
+        self._thrust = self._bladder_p * 9.5 * (
+            0.35 + 0.65 * self._prop_speed / PROPULSION_SPEED_MAX
+        )
+
+        # Carga y corriente del motor de propulsion.
+        if self._prop_speed <= 0.05:
+            self._prop_load = 0.0
+            self._prop_current = 0.0
+            return
+        load = 10.0 + 70.0 * (self._prop_speed / PROPULSION_SPEED_MAX) * self._ground_hardness
+        if "propulsion_overload" in self._faults:
+            load += PROPULSION_FAULT_LOAD_PCT
+        load += self._rng.uniform(-1.5, 1.5)
+        self._prop_load = max(0.0, load)
+        self._prop_current = max(
+            0.0, self._prop_load * PROPULSION_AMPS_PER_PCT + self._rng.uniform(-0.25, 0.25)
+        )
+
+    def _update_steering(self, dt):
+        if self._cmd["safe_torque_off"]:
+            return                       # direccion congelada en su posicion
+        step = STEER_RATE_MM_S * dt
+        self._steer_a += clamp(self._cmd["steer_a_setpoint_mm"] - self._steer_a, -step, step)
+        self._steer_b += clamp(self._cmd["steer_b_setpoint_mm"] - self._steer_b, -step, step)
+
+    def _update_hydroshield(self, dt):
+        target = self._cmd["hydroshield_setpoint_bar"]
+        self._hydro_p += (target - self._hydro_p) * min(1.0, dt / 2.5)
+        if target > 0.0:
+            # Rizado: 0.02 bar por paso de 100 ms, independiente del dt real.
+            self._hydro_p += 0.2 * dt * math.sin(self._sim_time * 1.3)
+        self._hydro_p = max(0.0, self._hydro_p)
+
+    def _update_navigation(self, dt):
+        """Integra los 6 grados de libertad. Solo avanza con autorizacion de avance."""
+        # Vibracion mecanica proporcional a las rpm del cabezal.
+        self._vib_phase += dt * 2.0 * math.pi * 1.7
+        amplitude = 0.35 * (self._ch_rpm / CUTTERHEAD_RPM_MAX)
+        self._vib_roll = amplitude * math.sin(self._vib_phase)
+        self._vib_pitch = amplitude * 0.5 * math.sin(self._vib_phase * 0.7)
+
+        if not self._cmd["advance_enabled"] or self._prop_speed <= 0.0:
+            self._yaw_rate = 0.0
+            return
+
+        ds = (self._prop_speed / 60000.0) * dt           # mm/min -> m en este paso
+        if ds <= 0.0:
+            return
+
+        d_heading = STEER_YAW_DEG_PER_M * self._steer_a * ds
+        self._heading = (self._heading + d_heading) % 360.0
+        self._yaw_rate = d_heading / dt if dt > 0 else 0.0
+        self._pitch = clamp(
+            self._pitch + STEER_PITCH_DEG_PER_M * self._steer_b * ds,
+            -PITCH_LIMIT_DEG,
+            PITCH_LIMIT_DEG,
+        )
+        self._roll += (0.02 * self._steer_a - self._roll * 0.5) * ds
+
+        heading_rad = math.radians(self._heading)
+        pitch_rad = math.radians(self._pitch)
+        horizontal = ds * math.cos(pitch_rad)
+
+        self._chainage += ds
+        self._easting += horizontal * math.sin(heading_rad)
+        self._northing += horizontal * math.cos(heading_rad)
+        self._elevation += ds * math.sin(pitch_rad)
+
+    def _update_thermal(self, dt):
+        tau = 60.0
+        head_target = AMBIENT_TEMP_C + 0.50 * self._ch_load
+        prop_target = AMBIENT_TEMP_C + 0.35 * (self._prop_speed / PROPULSION_SPEED_MAX) * 100.0
+        self._ch_temp += (head_target - self._ch_temp) * min(1.0, dt / tau)
+        self._prop_temp += (prop_target - self._prop_temp) * min(1.0, dt / tau)
+
+    def _update_wireless_sensor(self, dt):
+        """Bateria y latencia del sensor inalambrico de presion de vejiga."""
+        drain = (BLADDER_SENSOR_DRAIN_PCT_PER_H / 3600.0) * dt
+        if "bladder_sensor_battery" in self._faults:
+            drain += BLADDER_SENSOR_DRAIN_FAULT_PCT_S * dt
+        self._bs_battery = clamp(self._bs_battery - drain, 0.0, 100.0)
+
+        if "bladder_sensor_signal" in self._faults or self._bs_battery <= 0.0:
+            self._bs_link_ok = False
+            self._bs_signal_ms = BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
+            return
+        self._bs_link_ok = True
+        wander = self._rng.gauss(0.0, NOISE_SIGNAL_MS)
+        self._bs_signal_ms = max(4.0, BLADDER_SENSOR_SIGNAL_BASE_MS + wander)
+
+
+# =========================================================================
+# CAPA 3 - NUCLEO / DOMINIO (TBMController y logica de seguridad)
+# =========================================================================
+# El nucleo solo conoce `IHardwareAdapter`. Aqui viven las reglas de TBC y
+# del PDB: no hay ningun import de adaptadores ni de aiohttp en esta capa.
+
+# --- Cabezal de corte ---
+CUTTERHEAD_RPM_DEFAULT = 3.5
+CUTTERHEAD_RPM_MIN_MINING = 1.0     # rpm minimas para autorizar MINING
+CUTTERHEAD_LOAD_MAX_PCT = 100.0     # umbral de sobrecarga
+CUTTERHEAD_CURRENT_MAX_A = 32.0     # umbral de sobrecorriente
+OVERLOAD_DEBOUNCE_S = 1.5           # antirebote de los interlocks de sobrecarga
+
+# --- Propulsion ---
+PROPULSION_SPEED_DEFAULT = 42.0     # mm/min
+PROPULSION_LOAD_MAX_PCT = 100.0
+PROPULSION_CURRENT_MAX_A = 24.0
+
+# --- Vejiga de propulsion ---
+BLADDER_P_MIN = 1.20                # bar - por debajo se inhibe la propulsion
+BLADDER_P_MAX = 3.00                # bar - por encima: alivio + inhibicion
+BLADDER_P_TARGET_DEFAULT = 1.80
+BLADDER_P_TARGET_MAX = 2.60
+BLADDER_RELIEF_HYST = 0.25          # bar de histeresis para cerrar el alivio
+BLADDER_GRIP_GRACE_S = 6.0          # margen de inflado antes de armar el interlock de baja presion
+
+# --- Hydroshield (presion de soporte del frente) ---
+HYDROSHIELD_IDLE_BAR = 1.90
+HYDROSHIELD_MINING_BAR = 2.45
+
+# --- Sensor inalambrico de vejiga ---
+BLADDER_SENSOR_BATTERY_CRITICAL_PCT = 10.0
+BLADDER_SENSOR_SIGNAL_LOST_MS = 250.0       # umbral de perdida de enlace
+
+# --- Comunicaciones y watchdog ---
+WATCHDOG_TIMEOUT_S = 10.0           # un enlace armado sin vida > 10 s => FAULT
+UPLINK_MAX_FAILURES = 3             # POST a TBC fallidos consecutivos = enlace caido
+MAX_STEP_DT_S = 0.5                 # tope de dt entre ciclos de control
+
+LINK_HARDWARE = "hardware_network"  # check_network_health() del adaptador
+LINK_OPERATOR = "operator_station"  # latido de la estacion del operador
+LINK_UPLINK = "tbc_uplink"          # POST de telemetria hacia TBC
+
+# --- Subsistemas inhabilitables por interlock ---
+SUB_CUTTERHEAD = "cutterhead"
+SUB_PROPULSION = "propulsion"
+SUB_INFLATION = "inflation"
+SUB_STEERING = "steering"
+ALL_SUBSYSTEMS = (SUB_CUTTERHEAD, SUB_PROPULSION, SUB_INFLATION, SUB_STEERING)
+
 
 class State(Enum):
     """Estados permitidos de la tuneladora."""
@@ -216,9 +916,9 @@ ALLOWED_TRANSITIONS = {
     State.FAULT: {State.IDLE, State.E_STOPPED, State.POWER_OFF},
 }
 
-# Condicion de reinicio seguro: volver a un estado operativo desde una
-# parada de emergencia, una perdida de energia o una falla exige DOS
-# acciones independientes y en orden.
+# Safe Restart (TBC 10.g): volver a un estado operativo desde una parada de
+# emergencia, una perdida de energia o una falla exige DOS acciones
+# independientes y en orden.
 RESTART_SEQUENCES = {
     State.POWER_OFF: ("power_on", "arm"),
     State.E_STOPPED: ("reset_estop", "arm"),
@@ -265,13 +965,13 @@ class Interlock:
         self.triggered_at = None
         self.trip_count = 0
 
-    def trip(self):
+    def trip(self, wall_time):
         """Engancha el enclavamiento. Devuelve True solo la primera vez."""
         self.active = True
         if self.latched:
             return False
         self.latched = True
-        self.triggered_at = time.time()
+        self.triggered_at = wall_time
         self.trip_count += 1
         return True
 
@@ -292,75 +992,161 @@ class Interlock:
         }
 
 
-# =========================================================================
-# 4. GEMELO DIGITAL: ESTADO, FISICA Y SEGURIDAD
-# =========================================================================
+class LinkWatchdog:
+    """Watchdog de enlaces: mide hace cuanto cada enlace no da señales de vida."""
 
-class BichoSimulator:
-    """Gemelo digital del B.I.C.H.O.
+    def __init__(self, timeout_s, now):
+        self.timeout_s = float(timeout_s)
+        self._born = now
+        self._last_alive = {}
 
-    Encapsula la maquina de estados, el modelo fisico simplificado de los
-    subsistemas y los enclavamientos de seguridad. Todos los accesos
-    publicos son seguros entre hilos.
+    def alive(self, link, at):
+        previous = self._last_alive.get(link)
+        if previous is None or at > previous:
+            self._last_alive[link] = at
+
+    def silence(self, link, now):
+        return max(0.0, now - self._last_alive.get(link, self._born))
+
+    def expired(self, links, now):
+        """[(enlace, segundos_en_silencio)] de los enlaces que superan el timeout."""
+        result = []
+        for link in links:
+            silence = self.silence(link, now)
+            if silence > self.timeout_s:
+                result.append((link, silence))
+        return result
+
+    def worst_silence(self, links, now):
+        return max((self.silence(link, now) for link in links), default=0.0)
+
+
+class CommandOutcome(Enum):
+    ACCEPTED = "accepted"
+    REJECTED = "rejected"           # valido pero no permitido ahora (interlock, estado...)
+    INVALID = "invalid"             # comando desconocido o parametros invalidos
+
+
+@dataclass(frozen=True)
+class CommandResult:
+    """Resultado de un comando de operador (el nucleo no conoce HTTP)."""
+
+    ok: bool
+    outcome: CommandOutcome
+    command: str
+    message: str
+    state: State
+    mining: bool
+    estop_engaged: bool
+    active_interlocks: list
+    latched_interlocks: list
+    safe_restart: dict
+    timestamp: int
+
+
+@dataclass(frozen=True)
+class EstopResult:
+    """Resultado de una parada de emergencia solicitada por el puente PLC."""
+
+    source: str
+    state: State
+    previous_state: State
+    estop_engaged: bool
+    actuators_zeroed: bool
+    already_stopped: bool
+    message: str
+    timestamp: int
+
+
+@dataclass(frozen=True)
+class ControllerSnapshot:
+    """Foto inmutable del controlador (un ciclo de 10 Hz). Es la unica fuente
+    de datos de la capa de presentacion."""
+
+    wall_time: float
+    sample_index: int
+    uptime_s: float
+    adapter: str
+    state: State
+    previous_state: State
+    state_elapsed_s: float
+    estop_engaged: bool
+    hardware_estop: bool
+    sensors: dict
+    actuator_commands: dict
+    inhibited: dict
+    cutterhead_running: bool
+    cutterhead_rpm_setpoint: float
+    propulsion_enabled: bool
+    propulsion_speed_setpoint: float
+    bladder_setpoint_bar: float
+    bladder_inflating: bool
+    relief_valve_open: bool
+    steer_a_setpoint_mm: float
+    steer_b_setpoint_mm: float
+    mined_length_m: float
+    mining_time_s: float
+    interlocks: dict
+    active_interlocks: list
+    latched_interlocks: list
+    safe_restart: dict
+    allowed_transitions: list
+    comms: dict
+    commands_received: int
+    last_command: Optional[str]
+    injected_faults: list
+
+
+class TBMController:
+    """Cerebro supervisor de la tuneladora (nucleo / dominio).
+
+    Recibe un `IHardwareAdapter` por inyeccion de dependencias y ejecuta un
+    lazo de control NO bloqueante a 10 Hz (`run()` / `step()`):
+
+        leer sensores -> supervisar (E-Stop, interlocks, watchdog)
+                      -> calcular consignas con compuerta de seguridad
+                      -> escribir actuadores -> publicar snapshot
+
+    Todo corre en el hilo del event loop, por lo que el estado no necesita
+    candados: los comandos de la API y el lazo de control nunca se solapan.
     """
 
-    def __init__(self, comms_timeout=COMMS_TIMEOUT_S, start_state=State.POWER_OFF):
-        self._lock = threading.RLock()
-        self.comms_timeout = float(comms_timeout)
+    def __init__(
+        self,
+        hardware,
+        *,
+        watchdog_timeout_s=WATCHDOG_TIMEOUT_S,
+        start_state=State.POWER_OFF,
+        clock=time.monotonic,
+        wall_clock=time.time,
+    ):
+        if not isinstance(hardware, IHardwareAdapter):
+            raise TypeError("El hardware debe implementar IHardwareAdapter.")
+        self._hw = hardware
+        self._clock = clock
+        self._wall = wall_clock
+        self.watchdog_timeout_s = float(watchdog_timeout_s)
+
+        boot = clock()
+        self._boot = boot
 
         # --- Maquina de estados ---
         self.state = State.POWER_OFF
         self.previous_state = State.POWER_OFF
-        self.state_since = time.time()
+        self._state_since = boot
         self.estop_engaged = False
         self._restart_done = set()
 
-        # --- Navegacion 6DOF ---
-        self.chainage = START_CHAINAGE_M
-        self.easting = START_EASTING_M
-        self.northing = START_NORTHING_M
-        self.elevation = START_ELEVATION_M
-        self.roll = START_ROLL_DEG
-        self.pitch = START_PITCH_DEG
-        self.heading = START_HEADING_DEG
-        self.yaw_rate_deg_s = 0.0
-        self.vib_roll = 0.0
-        self.vib_pitch = 0.0
-        self._vib_phase = 0.0
-
-        # --- Cabezal de corte ---
+        # --- Intencion del operador (se filtra por la compuerta de seguridad) ---
         self.cutterhead_running = False
-        self.cutterhead_rpm = 0.0
         self.cutterhead_rpm_target = 0.0
-        self.cutterhead_load_pct = 0.0
-        self.cutterhead_current_a = 0.0
-        self.cutterhead_torque_nm = 0.0
-        self.cutterhead_temp_c = AMBIENT_TEMP_C
-
-        # --- Vejiga y propulsion ---
-        self.bladder_pressure = 0.0
-        self.bladder_target = 0.0
         self.bladder_inflating = False
+        self.bladder_target = 0.0
         self.relief_valve_open = False
         self.propulsion_enabled = False
-        self.propulsion_speed = 0.0
         self.propulsion_speed_target = PROPULSION_SPEED_DEFAULT
-        self.track_left_mm_min = 0.0
-        self.track_right_mm_min = 0.0
-        self.thrust_force_kn = 0.0
-        self.propulsion_temp_c = AMBIENT_TEMP_C
-
-        # --- Direccion ---
-        self.steer_a_mm = 0.0
-        self.steer_b_mm = 0.0
         self.steer_a_target_mm = 0.0
         self.steer_b_target_mm = 0.0
-
-        # --- Hydroshield y terreno ---
-        self.hydroshield_pressure = 0.0
-        self.ground_hardness = 1.0
-        self._ground_phase = 0.0
-        self._ground_walk = 0.0
 
         # --- Enclavamientos ---
         self.interlocks = {
@@ -369,6 +1155,12 @@ class BichoSimulator:
                 "Sobrecorriente o sobrecarga en el cabezal de corte",
                 {SUB_CUTTERHEAD, SUB_PROPULSION},
                 forces_fault=True,
+            ),
+            "propulsion_overload": Interlock(
+                "propulsion_overload",
+                "Sobrecorriente o sobrecarga en el motor de propulsion",
+                {SUB_PROPULSION},
+                forces_fault=False,
             ),
             "bladder_underpressure": Interlock(
                 "bladder_underpressure",
@@ -396,33 +1188,34 @@ class BichoSimulator:
             ),
         }
 
-        # --- Sensor inalambrico de vejiga (verdad fisica) ---
-        self.bladder_sensor_battery_pct = BLADDER_SENSOR_BATTERY_START
-        self.bladder_sensor_signal_ms = BLADDER_SENSOR_SIGNAL_BASE_MS
-        self.bladder_sensor_link_ok = True
+        # --- Lecturas y E/S con el hardware ---
+        self._sensors = {}
+        self._start_chainage = None
+        self._last_commands = safe_actuator_commands()
+        self._io_ok = True
+        self._io_prev_ok = True
+        self._io_error_logged = False
+        self._hw_link_ok = True
+        self._hw_estop_now = False
+        self._hw_estop_prev = False
 
-        # --- Fallas inyectadas desde POST /command ---
-        self.forced_overload = False
-        self.bladder_leak = False
-        self.pump_stuck = False
-        self.forced_comms_loss = False
-        self.forced_sensor_battery_drain = False
-        self.forced_sensor_signal_loss = False
-
-        # --- Snapshot de telemetria a 10 Hz ---
-        self.tick_count = 0
-        self._latest_telemetry = None
-
-        # --- Contadores y watchdog ---
-        self.boot_ts = time.time()
-        self.last_contact_ts = time.time()
-        self.last_command = None
-        self.commands_received = 0
-        self.mining_seconds = 0.0
+        # --- Watchdog de enlaces ---
+        self._watchdog = LinkWatchdog(self.watchdog_timeout_s, boot)
+        self._last_operator_contact = boot
         self.uplink_ok = None
         self.uplink_failures = 0
+        self.uplink_sent = 0
+
+        # --- Temporizadores, contadores y publicacion ---
+        self._last_step = None
         self._overload_timer = 0.0
+        self._prop_overload_timer = 0.0
         self._grip_timer = 0.0
+        self.mining_seconds = 0.0
+        self.tick_count = 0
+        self.commands_received = 0
+        self.last_command = None
+        self._snapshot = None
 
         self._commands = {
             "power_on": self._cmd_power_on,
@@ -443,6 +1236,7 @@ class BichoSimulator:
             "simulate_fault": self._cmd_simulate_fault,
             "heartbeat": self._cmd_heartbeat,
             "set_bladder_sensor": self._cmd_set_bladder_sensor,
+            "hardware_estop": self._cmd_hardware_estop,
         }
 
         if start_state is not State.POWER_OFF:
@@ -455,7 +1249,532 @@ class BichoSimulator:
             )
 
     # -------------------------------------------------------------------
-    # 4.1 Transiciones de estado
+    # 3.1 API publica del nucleo
+    # -------------------------------------------------------------------
+
+    @property
+    def adapter_name(self):
+        return type(self._hw).__name__
+
+    def command_names(self):
+        return sorted(self._commands)
+
+    async def run(self, period_s=TICK_PERIOD_S):
+        """Lazo de control no bloqueante (tarea asyncio) a 1/period_s Hz."""
+        log_info(
+            f"Lazo de control del nucleo activo a {1.0 / period_s:.0f} Hz "
+            f"(adaptador: {self.adapter_name})."
+        )
+        next_tick = self._clock()
+        failures = 0
+        while True:
+            try:
+                self.step()
+                failures = 0
+            except Exception as exc:               # el lazo nunca debe morir
+                failures += 1
+                if failures == 1 or failures % 50 == 0:
+                    log_warn(f"Error en el lazo de control: {exc!r}")
+                self._fail_safe()
+            next_tick += period_s
+            delay = next_tick - self._clock()
+            if delay <= 0.0:
+                next_tick = self._clock()
+                delay = 0.0
+            await asyncio.sleep(delay)
+
+    def step(self):
+        """Un ciclo de control. SIEMPRE lee los sensores, en cualquier estado
+        (incluido E-STOPPED), para mantener viva la telemetria de baja tension."""
+        now = self._clock()
+        if self._last_step is None:
+            dt = TICK_PERIOD_S
+        else:
+            dt = clamp(now - self._last_step, 0.0, MAX_STEP_DT_S)
+        self._last_step = now
+
+        self._acquire(now)
+        self._supervise(now, dt)
+        self._drive_outputs()
+        self.tick_count += 1
+        self._publish()
+
+    def snapshot(self):
+        """Ultima foto publicada a 10 Hz (inmutable)."""
+        if self._snapshot is None:
+            self.step()
+        return self._snapshot
+
+    def touch_operator(self):
+        """La estacion del operador dio señales de vida (latido del watchdog)."""
+        self._last_operator_contact = self._clock()
+
+    def register_uplink_result(self, ok, detail=""):
+        """El cliente TBC informa el resultado de cada POST."""
+        if ok:
+            if self.uplink_failures > 0:
+                log_net("Enlace de telemetria hacia TBC restablecido.")
+            self.uplink_ok = True
+            self.uplink_failures = 0
+            self.uplink_sent += 1
+            return
+        self.uplink_ok = False
+        self.uplink_failures += 1
+        if self.uplink_failures == 1:
+            log_net(f"Envio de telemetria a TBC fallido ({detail}).")
+        if self.uplink_failures == UPLINK_MAX_FAILURES:
+            log_net(
+                f"{self.uplink_failures} envios de telemetria fallidos consecutivos "
+                f"({detail}): enlace TBC caido; el watchdog de "
+                f"{self.watchdog_timeout_s:.0f} s queda en cuenta regresiva."
+            )
+
+    def execute(self, command, params):
+        """Ejecuta un comando de operador. Nunca se salta un interlock."""
+        self.touch_operator()
+        name = str(command).strip().lower()
+        params = params if isinstance(params, dict) else {}
+
+        handler = self._commands.get(name)
+        if handler is None:
+            log_warn(f"Comando desconocido: '{name}'")
+            return self._result(
+                False, CommandOutcome.INVALID, name,
+                f"Comando desconocido '{name}'. Comandos validos: "
+                f"{', '.join(self.command_names())}.",
+            )
+
+        self.commands_received += 1
+        self.last_command = name
+        log_command(f"'{name}' params={json.dumps(params, ensure_ascii=False)} "
+                    f"[estado={self.state.value}]")
+        try:
+            ok, message = handler(params)
+        except (TypeError, ValueError) as exc:
+            log_warn(f"'{name}' con parametros invalidos: {exc}")
+            self._flush_outputs()
+            return self._result(
+                False, CommandOutcome.INVALID, name, f"Parametros invalidos: {exc}"
+            )
+
+        if ok:
+            log_info(f"'{name}' ACEPTADO -> {message}")
+        else:
+            log_warn(f"'{name}' RECHAZADO -> {message}")
+        self._flush_outputs()
+        outcome = CommandOutcome.ACCEPTED if ok else CommandOutcome.REJECTED
+        return self._result(ok, outcome, name, message)
+
+    def trigger_plc_estop(self, source="PLC"):
+        """Puente de parada de emergencia del PLC: fuerza E-STOPPED de inmediato."""
+        already = self.state is State.E_STOPPED
+        if already:
+            self.estop_engaged = True
+            self._zero_actuators()
+            log_command(f"POST /api/plc/parada repetida desde {source} (ya en E-STOPPED)")
+        else:
+            log_command(f"POST /api/plc/parada desde {source} [estado={self.state.value}]")
+            self._set_state(
+                State.E_STOPPED,
+                f"parada de emergencia del controlador logico ({source})",
+            )
+        self._flush_outputs()               # ceros al hardware ANTES de confirmar
+        return EstopResult(
+            source=source,
+            state=self.state,
+            previous_state=self.previous_state,
+            estop_engaged=True,
+            actuators_zeroed=True,
+            already_stopped=already,
+            message=(
+                "Parada de emergencia confirmada. Actuadores en 0; "
+                "presiones, 6DOF y sensores siguen publicandose a 10 Hz."
+            ),
+            timestamp=int(self._wall()),
+        )
+
+    def _result(self, ok, outcome, command, message):
+        return CommandResult(
+            ok=ok,
+            outcome=outcome,
+            command=command,
+            message=message,
+            state=self.state,
+            mining=self.state is State.MINING,
+            estop_engaged=self.estop_engaged,
+            active_interlocks=sorted(k for k, lock in self.interlocks.items() if lock.active),
+            latched_interlocks=self._latched_keys(),
+            safe_restart=self._restart_status(),
+            timestamp=int(self._wall()),
+        )
+
+    # -------------------------------------------------------------------
+    # 3.2 Adquisicion de datos (puerto de hardware)
+    # -------------------------------------------------------------------
+
+    def _acquire(self, now):
+        """Lee sensores, salud de red y hongo fisico. Ante cualquier error de
+        E/S falla hacia el lado seguro."""
+        ok = True
+
+        try:
+            raw = self._hw.read_sensors()
+            missing = [key for key in SENSOR_KEYS if key not in raw]
+            if missing:
+                raise HardwareError(f"read_sensors() sin las claves {missing}")
+            self._sensors = dict(raw)
+            if self._start_chainage is None:
+                self._start_chainage = self._sensors["chainage_odometry_m"]
+        except Exception as exc:
+            ok = False
+            self._report_io_error("read_sensors", exc)
+
+        network_ok = self._hardware_network_ok()
+        if network_ok is None:
+            ok = False
+            network_ok = False
+        self._hw_link_ok = bool(network_ok) and ok
+        if self._hw_link_ok:
+            self._watchdog.alive(LINK_HARDWARE, now)
+
+        self._hw_estop_now = self._hardware_estop_pressed()
+        self._io_ok = ok
+        if ok:
+            self._io_error_logged = False
+
+    def _hardware_network_ok(self):
+        """check_network_health() protegido. None = error de E/S."""
+        try:
+            return bool(self._hw.check_network_health())
+        except Exception as exc:
+            self._report_io_error("check_network_health", exc)
+            return None
+
+    def _hardware_estop_pressed(self):
+        """Hongo fisico. Una falla al leerlo se trata como PRESIONADO (fail-safe)."""
+        try:
+            return bool(self._hw.is_hardware_estop_triggered())
+        except Exception as exc:
+            self._report_io_error("is_hardware_estop_triggered", exc)
+            return True
+
+    def _report_io_error(self, operation, exc):
+        if not self._io_error_logged:
+            self._io_error_logged = True
+            log_interlock(f"Error de E/S con el hardware en {operation}(): {exc!r}")
+
+    def _sensed(self, key, default=0.0):
+        return self._sensors.get(key, default)
+
+    # -------------------------------------------------------------------
+    # 3.3 Supervision: E-Stop, temporizadores, interlocks y watchdog
+    # -------------------------------------------------------------------
+
+    def _supervise(self, now, dt):
+        if not self._io_ok and self._io_prev_ok:
+            log_interlock(
+                "Fallo de E/S con el hardware: consignas a estado seguro (STO) "
+                "y actuacion detenida."
+            )
+            self._stop_all_actuation()
+            if self.state is State.MINING:
+                self._set_state(State.READY, "excavacion abortada por fallo de E/S del hardware")
+        self._io_prev_ok = self._io_ok
+
+        self._handle_hardware_estop()
+
+        if self.state is State.MINING:
+            self.mining_seconds += dt
+
+        inflate_ok = self.bladder_inflating and not self._inhibited(SUB_INFLATION)
+        gripping = inflate_ok and self.bladder_target >= BLADDER_P_MIN
+        self._grip_timer = self._grip_timer + dt if gripping else 0.0
+
+        if self._start_chainage is not None:
+            self._check_interlocks(now, dt)
+
+        if self.state in (State.E_STOPPED, State.FAULT):
+            self._zero_actuators()
+
+    def _handle_hardware_estop(self):
+        pressed = self._hw_estop_now
+        if pressed and not self._hw_estop_prev:
+            log_command("PARADA DE EMERGENCIA FISICA detectada en el hardware.")
+            self._restart_done = set()          # el reinicio en curso se invalida
+        self._hw_estop_prev = pressed
+        if not pressed:
+            return
+        self.estop_engaged = True
+        if self.state is not State.E_STOPPED:
+            self._set_state(State.E_STOPPED, "hongo de emergencia fisico (hardware)")
+
+    def _armed_links(self):
+        links = []
+        if self.state is not State.POWER_OFF:
+            links += [LINK_HARDWARE, LINK_UPLINK]
+        if self.state in (State.READY, State.MINING):
+            links.append(LINK_OPERATOR)
+        return links
+
+    def _check_interlocks(self, now, dt):
+        s = self._sensors
+
+        # --- 1. Sobrecorriente / sobrecarga del cabezal de corte ---
+        lock = self.interlocks["cutterhead_overload"]
+        overload = s["cutterhead_rpm"] > 0.0 and (
+            s["cutterhead_load_pct"] > CUTTERHEAD_LOAD_MAX_PCT
+            or s["cutterhead_current_a"] > CUTTERHEAD_CURRENT_MAX_A
+        )
+        lock.active = overload
+        self._overload_timer = (
+            self._overload_timer + dt if overload else max(0.0, self._overload_timer - dt)
+        )
+        if self._overload_timer >= OVERLOAD_DEBOUNCE_S:
+            self._trip(
+                lock,
+                f"carga {s['cutterhead_load_pct']:.0f} % / {s['cutterhead_current_a']:.1f} A "
+                f"(limites {CUTTERHEAD_LOAD_MAX_PCT:.0f} % / {CUTTERHEAD_CURRENT_MAX_A:.1f} A)",
+            )
+
+        # --- 2. Sobrecorriente / sobrecarga del motor de propulsion ---
+        lock = self.interlocks["propulsion_overload"]
+        prop_overload = s["propulsion_speed_mm_min"] > 0.0 and (
+            s["propulsion_load_pct"] > PROPULSION_LOAD_MAX_PCT
+            or s["propulsion_current_a"] > PROPULSION_CURRENT_MAX_A
+        )
+        lock.active = prop_overload
+        self._prop_overload_timer = (
+            self._prop_overload_timer + dt
+            if prop_overload else max(0.0, self._prop_overload_timer - dt)
+        )
+        if self._prop_overload_timer >= OVERLOAD_DEBOUNCE_S:
+            self._trip(
+                lock,
+                f"carga {s['propulsion_load_pct']:.0f} % / {s['propulsion_current_a']:.1f} A "
+                f"(limites {PROPULSION_LOAD_MAX_PCT:.0f} % / {PROPULSION_CURRENT_MAX_A:.1f} A)",
+            )
+
+        # --- 3. Perdida de presion en la vejiga de propulsion ---
+        pressure = s["bladder_pressure_bar"]
+        lock = self.interlocks["bladder_underpressure"]
+        armed = (
+            self.state in (State.READY, State.MINING)
+            and self.bladder_target >= BLADDER_P_MIN
+            and self._grip_timer >= BLADDER_GRIP_GRACE_S
+        )
+        lock.active = armed and pressure < BLADDER_P_MIN
+        if lock.active:
+            self._trip(
+                lock,
+                f"P_vejiga {pressure:.2f} bar < P_min {BLADDER_P_MIN:.2f} bar",
+            )
+
+        # --- 4. Sobrepresion en la vejiga: detiene inflado y dispara el alivio ---
+        lock = self.interlocks["bladder_overpressure"]
+        lock.active = pressure > BLADDER_P_MAX
+        if lock.active:
+            if not self.relief_valve_open:
+                self.relief_valve_open = True
+                log_interlock("Valvula de alivio de presion ABIERTA.")
+            self._trip(
+                lock,
+                f"P_vejiga {pressure:.2f} bar > P_max {BLADDER_P_MAX:.2f} bar",
+            )
+        elif self.relief_valve_open and pressure <= BLADDER_P_MAX - BLADDER_RELIEF_HYST:
+            self.relief_valve_open = False
+            log_interlock(f"Valvula de alivio CERRADA (P_vejiga {pressure:.2f} bar).")
+
+        # --- 5. Watchdog de red: aborto global si un enlace armado calla > 10 s ---
+        lock = self.interlocks["comms_loss"]
+        if self.uplink_failures < UPLINK_MAX_FAILURES:
+            self._watchdog.alive(LINK_UPLINK, now)
+        self._watchdog.alive(LINK_OPERATOR, self._last_operator_contact)
+        expired = self._watchdog.expired(self._armed_links(), now)
+        lock.active = bool(expired)
+        if expired:
+            detail = "; ".join(
+                f"enlace '{link}' sin señales de vida durante {silence:.1f} s"
+                for link, silence in expired
+            ) + f" (watchdog {self.watchdog_timeout_s:.1f} s)"
+            self._trip(lock, detail)
+
+        # --- 6. Sensor inalambrico de vejiga: bateria critica o enlace perdido ---
+        lock = self.interlocks["bladder_sensor"]
+        battery = s["bladder_sensor_battery_pct"]
+        signal_ms = s["bladder_sensor_signal_ms"]
+        battery_critical = battery <= BLADDER_SENSOR_BATTERY_CRITICAL_PCT
+        signal_lost = (
+            not s["bladder_sensor_link_ok"] or signal_ms >= BLADDER_SENSOR_SIGNAL_LOST_MS
+        )
+        lock.active = battery_critical or signal_lost
+        if lock.active:
+            if battery_critical and signal_lost:
+                detail = f"bateria {battery:.1f} % y señal {signal_ms:.0f} ms"
+            elif battery_critical:
+                detail = (
+                    f"bateria {battery:.1f} % <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} %"
+                )
+            else:
+                detail = (
+                    f"señal {signal_ms:.0f} ms >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms "
+                    "(enlace perdido)"
+                )
+            self._trip(lock, detail)
+
+    def _trip(self, lock, detail):
+        """Engancha un interlock y aplica sus acciones de mitigacion."""
+        if not lock.trip(self._wall()):
+            return
+
+        log_interlock(f"DISPARADO '{lock.key}': {lock.description}.")
+        log_interlock(f"   Causa: {detail}")
+        log_interlock(f"   Inhabilita: {', '.join(sorted(lock.inhibits))}")
+
+        for subsystem in lock.inhibits:
+            self._stop_subsystem(subsystem)
+
+        if lock.key == "bladder_overpressure":
+            self.relief_valve_open = True
+
+        if lock.forces_fault:
+            if self.state not in (State.POWER_OFF, State.E_STOPPED, State.FAULT):
+                self._set_state(State.FAULT, f"interlock '{lock.key}'")
+            else:
+                self._stop_all_actuation()
+        elif self.state is State.MINING and SUB_PROPULSION in lock.inhibits:
+            # Degradacion segura: sin propulsion no se puede excavar.
+            self._set_state(State.READY, f"excavacion abortada por interlock '{lock.key}'")
+
+    def _condition_present(self, key):
+        """Reevalua en el instante si la causa fisica de un interlock persiste."""
+        s = self._sensors
+        if key == "cutterhead_overload":
+            return s["cutterhead_rpm"] > 0.0 and (
+                s["cutterhead_load_pct"] > CUTTERHEAD_LOAD_MAX_PCT
+                or s["cutterhead_current_a"] > CUTTERHEAD_CURRENT_MAX_A
+            )
+        if key == "propulsion_overload":
+            return s["propulsion_speed_mm_min"] > 0.0 and (
+                s["propulsion_load_pct"] > PROPULSION_LOAD_MAX_PCT
+                or s["propulsion_current_a"] > PROPULSION_CURRENT_MAX_A
+            )
+        if key == "bladder_underpressure":
+            return (
+                self.bladder_target >= BLADDER_P_MIN
+                and s["bladder_pressure_bar"] < BLADDER_P_MIN
+                and self.state in (State.READY, State.MINING)
+            )
+        if key == "bladder_overpressure":
+            return s["bladder_pressure_bar"] > BLADDER_P_MAX
+        if key == "comms_loss":
+            return (not self._hw_link_ok) or self.uplink_failures >= UPLINK_MAX_FAILURES
+        if key == "bladder_sensor":
+            return (
+                not s["bladder_sensor_link_ok"]
+                or s["bladder_sensor_battery_pct"] <= BLADDER_SENSOR_BATTERY_CRITICAL_PCT
+                or s["bladder_sensor_signal_ms"] >= BLADDER_SENSOR_SIGNAL_LOST_MS
+            )
+        return False
+
+    # -------------------------------------------------------------------
+    # 3.4 Salidas: consignas con compuerta de seguridad
+    # -------------------------------------------------------------------
+
+    def _inhibited(self, subsystem):
+        """True si el subsistema esta inhabilitado por estado, E-Stop o interlock."""
+        if self.state in (State.POWER_OFF, State.E_STOPPED, State.FAULT):
+            return True
+        if self.estop_engaged or self._hw_estop_now:
+            return True
+        return any(
+            lock.latched and subsystem in lock.inhibits
+            for lock in self.interlocks.values()
+        )
+
+    def _latched_keys(self):
+        return sorted(key for key, lock in self.interlocks.items() if lock.latched)
+
+    def _compute_commands(self):
+        """Traduce la intencion del operador en consignas de hardware.
+
+        COMPUERTA DE SEGURIDAD (PDB 6.6.2): es el unico camino hacia los
+        actuadores y se aplica SIEMPRE, sin importar como se emitio la
+        intencion (comando manual, estado, etc.): un comando manual nunca
+        puede saltarse un interlock.
+        """
+        state = self.state
+        sto = (
+            state in (State.E_STOPPED, State.FAULT)
+            or self.estop_engaged
+            or self._hw_estop_now
+            or not self._io_ok
+        )
+
+        cutter_ok = self.cutterhead_running and not self._inhibited(SUB_CUTTERHEAD) and not sto
+        inflate_ok = self.bladder_inflating and not self._inhibited(SUB_INFLATION) and not sto
+
+        pressure = self._sensed("bladder_pressure_bar")
+        propulsion_ok = (
+            state is State.MINING
+            and not sto
+            and not self._inhibited(SUB_PROPULSION)
+            and pressure >= BLADDER_P_MIN
+        )
+        self.propulsion_enabled = propulsion_ok
+
+        if self._inhibited(SUB_STEERING) or sto:
+            # Direccion inhabilitada: mantener la posicion actual.
+            self.steer_a_target_mm = self._sensed("steer_a_mm")
+            self.steer_b_target_mm = self._sensed("steer_b_mm")
+
+        if state is State.POWER_OFF:
+            hydro = 0.0
+        elif state is State.MINING:
+            hydro = HYDROSHIELD_MINING_BAR
+        else:
+            hydro = HYDROSHIELD_IDLE_BAR
+
+        return {
+            "safe_torque_off": sto,
+            "main_power": state is not State.POWER_OFF,
+            "advance_enabled": state is State.MINING and not sto,
+            "cutterhead_rpm_setpoint": self.cutterhead_rpm_target if cutter_ok else 0.0,
+            "propulsion_speed_setpoint_mm_min": (
+                self.propulsion_speed_target if propulsion_ok else 0.0
+            ),
+            "bladder_inflate_enable": inflate_ok,
+            "bladder_pressure_setpoint_bar": self.bladder_target,
+            "relief_valve_open": self.relief_valve_open,
+            "steer_a_setpoint_mm": self.steer_a_target_mm,
+            "steer_b_setpoint_mm": self.steer_b_target_mm,
+            "hydroshield_setpoint_bar": hydro,
+        }
+
+    def _drive_outputs(self):
+        commands = self._compute_commands()
+        try:
+            self._hw.write_actuators(commands)
+            self._last_commands = commands
+        except Exception as exc:
+            self._io_ok = False
+            self._report_io_error("write_actuators", exc)
+
+    def _flush_outputs(self):
+        """Tras un comando: consignas al hardware YA (sin esperar al ciclo de
+        100 ms), relectura y nueva foto."""
+        now = self._clock()
+        self._drive_outputs()
+        self._acquire(now)
+        self._publish()
+
+    def _fail_safe(self):
+        try:
+            self._hw.write_actuators(safe_actuator_commands())
+        except Exception:
+            pass
+
+    # -------------------------------------------------------------------
+    # 3.5 Transiciones de estado
     # -------------------------------------------------------------------
 
     def _set_state(self, new_state, reason):
@@ -464,7 +1783,7 @@ class BichoSimulator:
         previous = self.state
         self.previous_state = previous
         self.state = new_state
-        self.state_since = time.time()
+        self._state_since = self._clock()
         self._restart_done = set()
         log_state(f"{previous.value}  ->  {new_state.value}   ({reason})")
         self._on_enter_state(new_state, previous)
@@ -511,578 +1830,83 @@ class BichoSimulator:
             self.bladder_inflating = False
             self.bladder_target = 0.0
         elif subsystem == SUB_STEERING:
-            self.steer_a_target_mm = self.steer_a_mm
-            self.steer_b_target_mm = self.steer_b_mm
+            self.steer_a_target_mm = self._sensed("steer_a_mm")
+            self.steer_b_target_mm = self._sensed("steer_b_mm")
 
     def _stop_all_actuation(self):
-        for subsystem in (SUB_CUTTERHEAD, SUB_PROPULSION, SUB_INFLATION, SUB_STEERING):
+        for subsystem in ALL_SUBSYSTEMS:
             self._stop_subsystem(subsystem)
 
     def _zero_actuators(self):
-        """Cae los actuadores a 0 de inmediato. No toca presiones ni pose 6DOF."""
+        """Intencion a 0 de inmediato (E-STOP / FAULT). El STO del hardware
+        corta los accionamientos; presiones y pose 6DOF siguen vivas."""
         self.cutterhead_running = False
-        self.cutterhead_rpm = 0.0
         self.cutterhead_rpm_target = 0.0
-        self.cutterhead_load_pct = 0.0
-        self.cutterhead_current_a = 0.0
-        self.cutterhead_torque_nm = 0.0
         self.propulsion_enabled = False
-        self.propulsion_speed = 0.0
         self.propulsion_speed_target = 0.0
-        self.track_left_mm_min = 0.0
-        self.track_right_mm_min = 0.0
-        self.yaw_rate_deg_s = 0.0
         self.bladder_inflating = False
 
-    def _inhibited(self, subsystem):
-        """True si el subsistema esta inhabilitado por estado o interlock."""
-        if self.state in (State.POWER_OFF, State.E_STOPPED, State.FAULT):
-            return True
-        if self.estop_engaged:
-            return True
-        return any(
-            lock.latched and subsystem in lock.inhibits
-            for lock in self.interlocks.values()
-        )
-
-    def _latched_keys(self):
-        return sorted(key for key, lock in self.interlocks.items() if lock.latched)
-
     # -------------------------------------------------------------------
-    # 4.2 Lazo de simulacion fisica
+    # 3.6 Publicacion de la foto de estado
     # -------------------------------------------------------------------
 
-    def tick(self, dt):
-        """Avanza la simulacion `dt` segundos y publica un sample a 10 Hz."""
-        with self._lock:
-            now = time.time()
-            self._update_ground(dt)
-            self._update_cutterhead(dt)
-            self._update_bladder(dt)
-            self._update_propulsion(dt)
-            self._update_steering(dt)
-            self._update_hydroshield(dt)
-            self._update_navigation(dt)
-            self._update_thermal(dt)
-            self._update_wireless_sensor(dt)
-            if self.state is State.MINING:
-                self.mining_seconds += dt
-            self._check_interlocks(now, dt)
-            if self.state in (State.E_STOPPED, State.FAULT):
-                self._zero_actuators()
-            self.tick_count += 1
-            self._latest_telemetry = self._build_telemetry(now)
-
-    def _update_ground(self, dt):
-        """Dureza del terreno: deriva lenta + caminata aleatoria acotada."""
-        self._ground_phase += dt * 0.05
-        self._ground_walk = clamp(
-            self._ground_walk + random.uniform(-0.05, 0.05) * dt, -0.08, 0.08
+    def _publish(self):
+        now = self._clock()
+        comms_lock = self.interlocks["comms_loss"]
+        armed = self._armed_links()
+        s = self._sensors
+        mined = (
+            s["chainage_odometry_m"] - self._start_chainage
+            if self._start_chainage is not None and s else 0.0
         )
-        self.ground_hardness = clamp(
-            1.0 + 0.10 * math.sin(self._ground_phase) + self._ground_walk, 0.82, 1.18
+        injected = (
+            self._hw.injected_faults() if isinstance(self._hw, IFaultInjectionPort) else []
         )
-
-    def _update_cutterhead(self, dt):
-        if self.state in (State.E_STOPPED, State.FAULT):
-            self._zero_actuators()
-            return
-        allowed = self.cutterhead_running and not self._inhibited(SUB_CUTTERHEAD)
-        target = self.cutterhead_rpm_target if allowed else 0.0
-
-        if self.cutterhead_rpm < target:
-            self.cutterhead_rpm = min(target, self.cutterhead_rpm + CUTTERHEAD_RPM_RAMP * dt)
-        else:
-            self.cutterhead_rpm = max(target, self.cutterhead_rpm - CUTTERHEAD_RPM_BRAKE * dt)
-
-        if self.cutterhead_rpm <= 0.01:
-            self.cutterhead_rpm = 0.0
-            self.cutterhead_load_pct = 0.0
-            self.cutterhead_current_a = 0.0
-            self.cutterhead_torque_nm = 0.0
-            return
-
-        # Carga = f(rpm, dureza del terreno, empuje aplicado)
-        load = 8.0 + 95.0 * (self.cutterhead_rpm / CUTTERHEAD_RPM_MAX) * self.ground_hardness
-        if self.state is State.MINING and self.propulsion_speed > 1.0:
-            load *= 1.0 + 0.55 * (self.propulsion_speed / PROPULSION_SPEED_MAX)
-        if self.forced_overload:
-            load += 55.0
-        load += random.uniform(-1.5, 1.5)
-
-        self.cutterhead_load_pct = max(0.0, load)
-        self.cutterhead_current_a = max(
-            0.0, self.cutterhead_load_pct * CUTTERHEAD_AMPS_PER_PCT + random.uniform(-0.25, 0.25)
-        )
-        self.cutterhead_torque_nm = CUTTERHEAD_TORQUE_MAX_NM * self.cutterhead_load_pct / 100.0
-
-    def _update_bladder(self, dt):
-        inflate_ok = self.bladder_inflating and not self._inhibited(SUB_INFLATION)
-        pressure = self.bladder_pressure
-
-        if self.pump_stuck:
-            # Valvula de inflado trabada: sube ignorando la consigna.
-            pressure += BLADDER_PUMP_STUCK_RATE * dt
-        elif inflate_ok and self.bladder_target > 0.0:
-            error = self.bladder_target - pressure
-            if error > 0.0:
-                pressure += min(BLADDER_INFLATE_RATE, error * 2.5) * dt
-            elif error < -0.05:
-                pressure -= min(BLADDER_INFLATE_RATE, -error * 2.0) * dt
-
-        pressure -= BLADDER_LEAK_RATE * dt
-        if self.bladder_leak:
-            pressure -= BLADDER_LEAK_FAULT_RATE * dt
-        if self.relief_valve_open:
-            pressure -= BLADDER_RELIEF_RATE * dt
-        if not inflate_ok and not self.pump_stuck and self.state is State.POWER_OFF:
-            pressure -= 0.10 * dt          # sin energia la vejiga se despresuriza
-
-        self.bladder_pressure = max(0.0, pressure)
-
-        # Temporizador de agarre: cuenta el tiempo desde que se ordeno
-        # presurizar la vejiga. Da margen a la bomba para alcanzar P_min
-        # antes de armar el interlock de baja presion.
-        gripping = inflate_ok and self.bladder_target >= BLADDER_P_MIN
-        self._grip_timer = self._grip_timer + dt if gripping else 0.0
-
-    def _update_propulsion(self, dt):
-        if self.state in (State.E_STOPPED, State.FAULT):
-            self.propulsion_enabled = False
-            self.propulsion_speed = 0.0
-            self.propulsion_speed_target = 0.0
-            self.track_left_mm_min = 0.0
-            self.track_right_mm_min = 0.0
-            return
-        allowed = (
-            self.state is State.MINING
-            and not self._inhibited(SUB_PROPULSION)
-            and self.bladder_pressure >= BLADDER_P_MIN
-        )
-        self.propulsion_enabled = allowed
-        target = self.propulsion_speed_target if allowed else 0.0
-
-        if self.propulsion_speed < target:
-            self.propulsion_speed = min(target, self.propulsion_speed + PROPULSION_RAMP * dt)
-        else:
-            self.propulsion_speed = max(target, self.propulsion_speed - PROPULSION_RAMP * dt)
-        if self.propulsion_speed < 0.05:
-            self.propulsion_speed = 0.0
-
-        # Orugas de propulsion: el motor A introduce un diferencial de velocidad.
-        differential = self.steer_a_mm / STEER_STROKE_MM
-        self.track_left_mm_min = self.propulsion_speed * (1.0 + 0.25 * differential)
-        self.track_right_mm_min = self.propulsion_speed * (1.0 - 0.25 * differential)
-        self.thrust_force_kn = self.bladder_pressure * 9.5 * (
-            0.35 + 0.65 * self.propulsion_speed / PROPULSION_SPEED_MAX
-        )
-
-    def _update_steering(self, dt):
-        if self._inhibited(SUB_STEERING):
-            self.steer_a_target_mm = self.steer_a_mm
-            self.steer_b_target_mm = self.steer_b_mm
-            return
-        step = STEER_RATE_MM_S * dt
-        for axis in ("a", "b"):
-            current = getattr(self, f"steer_{axis}_mm")
-            goal = getattr(self, f"steer_{axis}_target_mm")
-            delta = clamp(goal - current, -step, step)
-            setattr(self, f"steer_{axis}_mm", current + delta)
-
-    def _update_hydroshield(self, dt):
-        # En E-STOPPED / FAULT el fluido y los sensores siguen vivos.
-        if self.state is State.POWER_OFF:
-            target = 0.0
-        elif self.state is State.MINING:
-            target = HYDROSHIELD_MINING_BAR
-        else:
-            target = HYDROSHIELD_IDLE_BAR
-        self.hydroshield_pressure += (target - self.hydroshield_pressure) * min(1.0, dt / 2.5)
-        if target > 0.0:
-            self.hydroshield_pressure += 0.02 * math.sin(time.time() * 1.3)
-        self.hydroshield_pressure = max(0.0, self.hydroshield_pressure)
-
-    def _update_wireless_sensor(self, dt):
-        """Bateria y latencia del sensor inalambrico de presion de vejiga."""
-        drain = (BLADDER_SENSOR_DRAIN_PCT_PER_H / 3600.0) * dt
-        if self.forced_sensor_battery_drain:
-            drain += BLADDER_SENSOR_DRAIN_FAULT_PCT_S * dt
-        self.bladder_sensor_battery_pct = clamp(
-            self.bladder_sensor_battery_pct - drain, 0.0, 100.0
-        )
-        if self.forced_sensor_signal_loss or self.bladder_sensor_battery_pct <= 0.0:
-            self.bladder_sensor_link_ok = False
-            self.bladder_sensor_signal_ms = BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
-            return
-        self.bladder_sensor_link_ok = True
-        wander = random.gauss(0.0, NOISE_SIGNAL_MS)
-        self.bladder_sensor_signal_ms = max(
-            4.0, BLADDER_SENSOR_SIGNAL_BASE_MS + wander
-        )
-
-    def _update_navigation(self, dt):
-        """Integra los 6 grados de libertad. Solo avanza en MINING."""
-        # Vibracion mecanica proporcional a las rpm del cabezal.
-        self._vib_phase += dt * 2.0 * math.pi * 1.7
-        amplitude = 0.35 * (self.cutterhead_rpm / CUTTERHEAD_RPM_MAX)
-        self.vib_roll = amplitude * math.sin(self._vib_phase)
-        self.vib_pitch = amplitude * 0.5 * math.sin(self._vib_phase * 0.7)
-
-        if self.state is not State.MINING or self.propulsion_speed <= 0.0:
-            self.yaw_rate_deg_s = 0.0
-            return
-
-        ds = (self.propulsion_speed / 60000.0) * dt      # mm/min -> m en este tick
-        if ds <= 0.0:
-            return
-
-        d_heading = STEER_YAW_DEG_PER_M * self.steer_a_mm * ds
-        self.heading = (self.heading + d_heading) % 360.0
-        self.yaw_rate_deg_s = d_heading / dt if dt > 0 else 0.0
-        self.pitch = clamp(
-            self.pitch + STEER_PITCH_DEG_PER_M * self.steer_b_mm * ds,
-            -PITCH_LIMIT_DEG,
-            PITCH_LIMIT_DEG,
-        )
-        self.roll += (0.02 * self.steer_a_mm - self.roll * 0.5) * ds
-
-        heading_rad = math.radians(self.heading)
-        pitch_rad = math.radians(self.pitch)
-        horizontal = ds * math.cos(pitch_rad)
-
-        self.chainage += ds
-        self.easting += horizontal * math.sin(heading_rad)
-        self.northing += horizontal * math.cos(heading_rad)
-        self.elevation += ds * math.sin(pitch_rad)
-
-    def _update_thermal(self, dt):
-        tau = 60.0
-        head_target = AMBIENT_TEMP_C + 0.50 * self.cutterhead_load_pct
-        prop_target = AMBIENT_TEMP_C + 0.35 * (self.propulsion_speed / PROPULSION_SPEED_MAX) * 100.0
-        self.cutterhead_temp_c += (head_target - self.cutterhead_temp_c) * min(1.0, dt / tau)
-        self.propulsion_temp_c += (prop_target - self.propulsion_temp_c) * min(1.0, dt / tau)
-
-    # -------------------------------------------------------------------
-    # 4.3 Interlocks automaticos (gatillos de falla)
-    # -------------------------------------------------------------------
-
-    def _check_interlocks(self, now, dt):
-        # --- 1. Sobrecorriente / sobrecarga del cabezal de corte ---
-        lock = self.interlocks["cutterhead_overload"]
-        overload = self.cutterhead_rpm > 0.0 and (
-            self.cutterhead_load_pct > CUTTERHEAD_LOAD_MAX_PCT
-            or self.cutterhead_current_a > CUTTERHEAD_CURRENT_MAX_A
-        )
-        lock.active = overload
-        self._overload_timer = (
-            self._overload_timer + dt if overload else max(0.0, self._overload_timer - dt)
-        )
-        if self._overload_timer >= OVERLOAD_DEBOUNCE_S:
-            self._trip(
-                lock,
-                f"carga {self.cutterhead_load_pct:.0f} % / {self.cutterhead_current_a:.1f} A "
-                f"(limites {CUTTERHEAD_LOAD_MAX_PCT:.0f} % / {CUTTERHEAD_CURRENT_MAX_A:.1f} A)",
-            )
-
-        # --- 2. Baja presion en la vejiga de propulsion ---
-        lock = self.interlocks["bladder_underpressure"]
-        armed = (
-            self.state in (State.READY, State.MINING)
-            and self.bladder_target >= BLADDER_P_MIN
-            and self._grip_timer >= BLADDER_GRIP_GRACE_S
-        )
-        lock.active = armed and self.bladder_pressure < BLADDER_P_MIN
-        if lock.active:
-            self._trip(
-                lock,
-                f"P_vejiga {self.bladder_pressure:.2f} bar < P_min {BLADDER_P_MIN:.2f} bar",
-            )
-
-        # --- 3. Sobrepresion en la vejiga de propulsion ---
-        lock = self.interlocks["bladder_overpressure"]
-        lock.active = self.bladder_pressure > BLADDER_P_MAX
-        if lock.active:
-            if not self.relief_valve_open:
-                self.relief_valve_open = True
-                log_interlock("Valvula de alivio de presion ABIERTA.")
-            self._trip(
-                lock,
-                f"P_vejiga {self.bladder_pressure:.2f} bar > P_max {BLADDER_P_MAX:.2f} bar",
-            )
-        elif self.relief_valve_open and self.bladder_pressure <= BLADDER_P_MAX - BLADDER_RELIEF_HYST:
-            self.relief_valve_open = False
-            log_interlock(
-                f"Valvula de alivio CERRADA (P_vejiga {self.bladder_pressure:.2f} bar)."
-            )
-
-        # --- 4. Perdida de comunicacion de red ---
-        lock = self.interlocks["comms_loss"]
-        silence = now - self.last_contact_ts
-        watchdog_armed = self.state in (State.READY, State.MINING)
-        lock.active = self.forced_comms_loss or (watchdog_armed and silence > self.comms_timeout)
-        if lock.active:
-            detail = (
-                "perdida forzada por comando de prueba"
-                if self.forced_comms_loss
-                else f"sin trafico durante {silence:.1f} s (timeout {self.comms_timeout:.1f} s)"
-            )
-            self._trip(lock, detail)
-
-        # --- 5. Sensor inalambrico de vejiga: bateria critica o enlace perdido ---
-        lock = self.interlocks["bladder_sensor"]
-        battery_critical = self.bladder_sensor_battery_pct <= BLADDER_SENSOR_BATTERY_CRITICAL_PCT
-        signal_lost = (
-            not self.bladder_sensor_link_ok
-            or self.bladder_sensor_signal_ms >= BLADDER_SENSOR_SIGNAL_LOST_MS
-        )
-        lock.active = battery_critical or signal_lost
-        if lock.active:
-            if battery_critical and signal_lost:
-                detail = (
-                    f"bateria {self.bladder_sensor_battery_pct:.1f} % y señal "
-                    f"{self.bladder_sensor_signal_ms:.0f} ms"
-                )
-            elif battery_critical:
-                detail = (
-                    f"bateria {self.bladder_sensor_battery_pct:.1f} % "
-                    f"<= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} %"
-                )
-            else:
-                detail = (
-                    f"señal {self.bladder_sensor_signal_ms:.0f} ms "
-                    f">= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms (enlace perdido)"
-                )
-            self._trip(lock, detail)
-
-    def _trip(self, lock, detail):
-        """Engancha un interlock y aplica sus acciones de mitigacion."""
-        if not lock.trip():
-            return
-
-        log_interlock(f"DISPARADO '{lock.key}': {lock.description}.")
-        log_interlock(f"   Causa: {detail}")
-        log_interlock(f"   Inhabilita: {', '.join(sorted(lock.inhibits))}")
-
-        for subsystem in lock.inhibits:
-            self._stop_subsystem(subsystem)
-
-        if lock.key == "bladder_overpressure":
-            self.relief_valve_open = True
-
-        if lock.forces_fault:
-            if self.state not in (State.POWER_OFF, State.E_STOPPED, State.FAULT):
-                self._set_state(State.FAULT, f"interlock '{lock.key}'")
-            else:
-                self._stop_all_actuation()
-        elif self.state is State.MINING and SUB_PROPULSION in lock.inhibits:
-            # Degradacion segura: sin propulsion no se puede excavar.
-            self._set_state(State.READY, f"excavacion abortada por interlock '{lock.key}'")
-
-    def _condition_present(self, key):
-        """Reevalua en el instante si la causa fisica de un interlock persiste."""
-        if key == "cutterhead_overload":
-            return self.cutterhead_rpm > 0.0 and (
-                self.cutterhead_load_pct > CUTTERHEAD_LOAD_MAX_PCT
-                or self.cutterhead_current_a > CUTTERHEAD_CURRENT_MAX_A
-            )
-        if key == "bladder_underpressure":
-            return (
-                self.bladder_target >= BLADDER_P_MIN
-                and self.bladder_pressure < BLADDER_P_MIN
-                and self.state in (State.READY, State.MINING)
-            )
-        if key == "bladder_overpressure":
-            return self.bladder_pressure > BLADDER_P_MAX
-        if key == "comms_loss":
-            return self.forced_comms_loss or (
-                time.time() - self.last_contact_ts > self.comms_timeout
-            )
-        if key == "bladder_sensor":
-            return (
-                self.forced_sensor_signal_loss
-                or not self.bladder_sensor_link_ok
-                or self.bladder_sensor_battery_pct <= BLADDER_SENSOR_BATTERY_CRITICAL_PCT
-                or self.bladder_sensor_signal_ms >= BLADDER_SENSOR_SIGNAL_LOST_MS
-            )
-        return False
-
-    def _white_noise(self, sigma):
-        return random.gauss(0.0, sigma) if sigma > 0.0 else 0.0
-
-    def _sensor(self, truth, sigma, low=None, high=None):
-        """Lectura de sensor = verdad + ruido blanco (para probar filtros)."""
-        value = truth + self._white_noise(sigma)
-        if low is not None:
-            value = max(low, value)
-        if high is not None:
-            value = min(high, value)
-        return value
-
-    # -------------------------------------------------------------------
-    # 4.4 Telemetria (formato obligatorio TBC)
-    # -------------------------------------------------------------------
-
-    def touch_comms(self):
-        """Refresca el watchdog de red: hubo trafico con la superficie."""
-        with self._lock:
-            self.last_contact_ts = time.time()
-
-    def telemetry(self):
-        """Devuelve el ultimo sample generado a 10 Hz."""
-        with self._lock:
-            if self._latest_telemetry is None:
-                self._latest_telemetry = self._build_telemetry(time.time())
-            return copy.deepcopy(self._latest_telemetry)
-
-    def _build_telemetry(self, now):
-        roll_meas = self._sensor(self.roll + self.vib_roll, NOISE_ATTITUDE_DEG)
-        pitch_meas = self._sensor(self.pitch + self.vib_pitch, NOISE_ATTITUDE_DEG)
-        heading_meas = (self._sensor(self.heading, NOISE_ATTITUDE_DEG) % 360.0)
-        bladder_meas = self._sensor(self.bladder_pressure, NOISE_PRESSURE_BAR, 0.0)
-        hydro_meas = self._sensor(self.hydroshield_pressure, NOISE_PRESSURE_BAR, 0.0)
-        battery_meas = self._sensor(
-            self.bladder_sensor_battery_pct, NOISE_BATTERY_PCT, 0.0, 100.0
-        )
-        if self.bladder_sensor_link_ok:
-            signal_meas = self._sensor(self.bladder_sensor_signal_ms, NOISE_SIGNAL_MS, 1.0)
-        else:
-            signal_meas = BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
-        load_meas = self._sensor(self.cutterhead_load_pct, NOISE_LOAD_PCT, 0.0)
-        current_meas = self._sensor(self.cutterhead_current_a, NOISE_CURRENT_A, 0.0)
-        head_temp = self._sensor(self.cutterhead_temp_c, NOISE_TEMP_C)
-        prop_temp = self._sensor(self.propulsion_temp_c, NOISE_TEMP_C)
-        return {
-            "team": TEAM_NAME,
-            "timestamp": int(now),
-            "mining": self.state is State.MINING,
-            "chainage": round(self._sensor(self.chainage, NOISE_POSE_M), 3),
-            "easting": round(self._sensor(self.easting, NOISE_POSE_M), 3),
-            "northing": round(self._sensor(self.northing, NOISE_POSE_M), 3),
-            "elevation": round(self._sensor(self.elevation, NOISE_POSE_M), 3),
-            "roll": round(roll_meas, 3),
-            "pitch": round(pitch_meas, 3),
-            "heading": round(heading_meas, 3),
-            "extra": self._extra_block(
-                now, bladder_meas, hydro_meas, battery_meas, signal_meas,
-                load_meas, current_meas, head_temp, prop_temp,
-            ),
-        }
-
-    def _extra_block(
-        self, now, bladder_meas, hydro_meas, battery_meas, signal_meas,
-        load_meas, current_meas, head_temp, prop_temp,
-    ):
-        silence = now - self.last_contact_ts
-        return {
-            # --- Claves planas (compatibilidad con el dashboard actual) ---
-            "cutterhead_rpm": round(self.cutterhead_rpm, 2),
-            "cutterhead_load_percent": round(load_meas, 1),
-            "bladder_pressure_bar": round(bladder_meas, 3),
-            "hydroshield_pressure_bar": round(hydro_meas, 3),
-            "propulsion_speed_mm_min": round(self.propulsion_speed, 2),
-            "bladder_sensor_battery_percent": round(battery_meas, 1),
-            "bladder_sensor_signal_ms": round(signal_meas, 1),
-
-            # --- Maquina de estados ---
-            "state": self.state.value,
-            "previous_state": self.previous_state.value,
-            "state_elapsed_s": round(now - self.state_since, 1),
-            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + "Z",
-            "timestamp_unix_ms": int(now * 1000),
-            "sample_hz": TICK_HZ,
-            "sample_index": self.tick_count,
-
-            "cutterhead": {
-                "running": self.cutterhead_running,
-                "rpm": round(self.cutterhead_rpm, 2),
-                "rpm_setpoint": round(self.cutterhead_rpm_target, 2),
-                "load_percent": round(load_meas, 1),
-                "current_a": round(current_meas, 2),
-                "torque_nm": round(self.cutterhead_torque_nm, 1),
-                "motor_temp_c": round(head_temp, 1),
-                "load_limit_percent": CUTTERHEAD_LOAD_MAX_PCT,
-                "current_limit_a": CUTTERHEAD_CURRENT_MAX_A,
-                "inhibited": self._inhibited(SUB_CUTTERHEAD),
-            },
-            "propulsion": {
-                "enabled": self.propulsion_enabled,
-                "speed_mm_min": round(self.propulsion_speed, 2),
-                "speed_setpoint_mm_min": round(self.propulsion_speed_target, 2),
-                "track_left_mm_min": round(self.track_left_mm_min, 2),
-                "track_right_mm_min": round(self.track_right_mm_min, 2),
-                "thrust_force_kn": round(self.thrust_force_kn, 2),
-                "motor_temp_c": round(prop_temp, 1),
-                "inhibited": self._inhibited(SUB_PROPULSION),
-            },
-            "bladder": {
-                "pressure_bar": round(bladder_meas, 3),
-                "setpoint_bar": round(self.bladder_target, 3),
-                "p_min_bar": BLADDER_P_MIN,
-                "p_max_bar": BLADDER_P_MAX,
-                "inflating": self.bladder_inflating and not self._inhibited(SUB_INFLATION),
-                "relief_valve_open": self.relief_valve_open,
-                "gripped": self.bladder_pressure >= BLADDER_P_MIN,
-                "wireless_sensor": {
-                    "battery_percent": round(battery_meas, 1),
-                    "signal_ms": round(signal_meas, 1),
-                    "link_ok": self.bladder_sensor_link_ok,
-                    "battery_critical_percent": BLADDER_SENSOR_BATTERY_CRITICAL_PCT,
-                    "signal_lost_ms": BLADDER_SENSOR_SIGNAL_LOST_MS,
-                },
-            },
-            "steering": {
-                "motor_a_mm": round(self.steer_a_mm, 2),
-                "motor_b_mm": round(self.steer_b_mm, 2),
-                "motor_a_setpoint_mm": round(self.steer_a_target_mm, 2),
-                "motor_b_setpoint_mm": round(self.steer_b_target_mm, 2),
-                "stroke_limit_mm": STEER_STROKE_MM,
-                "yaw_rate_deg_s": round(self.yaw_rate_deg_s, 4),
-                "inhibited": self._inhibited(SUB_STEERING),
-            },
-            "navigation": {
-                "advance_rate_mm_min": round(self.propulsion_speed, 2),
-                "chainage_m": round(self.chainage, 3),
-                "mined_length_m": round(self.chainage - START_CHAINAGE_M, 3),
-                "mining_time_s": round(self.mining_seconds, 1),
-                "ground_hardness_index": round(self.ground_hardness, 3),
-            },
-            "safety": {
-                "estop_engaged": self.estop_engaged,
-                "active_interlocks": sorted(
-                    key for key, lock in self.interlocks.items() if lock.active
-                ),
-                "latched_interlocks": self._latched_keys(),
-                "interlocks": {key: lock.snapshot() for key, lock in self.interlocks.items()},
-                "safe_restart": self._restart_status(),
-                "allowed_transitions": sorted(s.value for s in ALLOWED_TRANSITIONS[self.state]),
-            },
-            "comms": {
-                "ok": not self.interlocks["comms_loss"].latched,
-                "seconds_since_last_contact": round(silence, 2),
-                "timeout_s": self.comms_timeout,
+        self._snapshot = ControllerSnapshot(
+            wall_time=self._wall(),
+            sample_index=self.tick_count,
+            uptime_s=now - self._boot,
+            adapter=self.adapter_name,
+            state=self.state,
+            previous_state=self.previous_state,
+            state_elapsed_s=now - self._state_since,
+            estop_engaged=self.estop_engaged,
+            hardware_estop=self._hw_estop_now,
+            sensors=dict(s),
+            actuator_commands=dict(self._last_commands),
+            inhibited={sub: self._inhibited(sub) for sub in ALL_SUBSYSTEMS},
+            cutterhead_running=self.cutterhead_running,
+            cutterhead_rpm_setpoint=self.cutterhead_rpm_target,
+            propulsion_enabled=self.propulsion_enabled,
+            propulsion_speed_setpoint=self.propulsion_speed_target,
+            bladder_setpoint_bar=self.bladder_target,
+            bladder_inflating=self.bladder_inflating and not self._inhibited(SUB_INFLATION),
+            relief_valve_open=self.relief_valve_open,
+            steer_a_setpoint_mm=self.steer_a_target_mm,
+            steer_b_setpoint_mm=self.steer_b_target_mm,
+            mined_length_m=mined,
+            mining_time_s=self.mining_seconds,
+            interlocks={key: lock.snapshot() for key, lock in self.interlocks.items()},
+            active_interlocks=sorted(k for k, lock in self.interlocks.items() if lock.active),
+            latched_interlocks=self._latched_keys(),
+            safe_restart=self._restart_status(),
+            allowed_transitions=sorted(t.value for t in ALLOWED_TRANSITIONS[self.state]),
+            comms={
+                "ok": not comms_lock.latched,
+                "seconds_since_last_contact": max(0.0, now - self._last_operator_contact),
+                "timeout_s": self.watchdog_timeout_s,
                 "uplink_ok": self.uplink_ok,
                 "uplink_failures": self.uplink_failures,
+                "uplink_sent": self.uplink_sent,
+                "network_healthy": self._hw_link_ok,
+                "io_ok": self._io_ok,
+                "watchdog_armed_links": armed,
+                "watchdog_silence_s": self._watchdog.worst_silence(armed, now),
             },
-            "sim": {
-                "version": VERSION,
-                "tick_hz": TICK_HZ,
-                "uptime_s": round(now - self.boot_ts, 1),
-                "commands_received": self.commands_received,
-                "last_command": self.last_command,
-                "injected_faults": sorted(
-                    name
-                    for name, flag in (
-                        ("cutterhead_overload", self.forced_overload),
-                        ("bladder_underpressure", self.bladder_leak),
-                        ("bladder_overpressure", self.pump_stuck),
-                        ("comms_loss", self.forced_comms_loss),
-                        ("bladder_sensor_battery", self.forced_sensor_battery_drain),
-                        ("bladder_sensor_signal", self.forced_sensor_signal_loss),
-                    )
-                    if flag
-                ),
-            },
-        }
+            commands_received=self.commands_received,
+            last_command=self.last_command,
+            injected_faults=injected,
+        )
 
     def _restart_status(self):
         sequence = RESTART_SEQUENCES.get(self.state)
@@ -1096,108 +1920,9 @@ class BichoSimulator:
             "pending": [step for step in sequence if step not in self._restart_done],
         }
 
-    def status_summary(self):
-        with self._lock:
-            return {
-                "ok": True,
-                "team": TEAM_NAME,
-                "state": self.state.value,
-                "mining": self.state is State.MINING,
-                "estop_engaged": self.estop_engaged,
-                "latched_interlocks": self._latched_keys(),
-                "safe_restart": self._restart_status(),
-                "uptime_s": round(time.time() - self.boot_ts, 1),
-            }
-
     # -------------------------------------------------------------------
-    # 4.5 Modo manual / ingenieria: POST /command
+    # 3.7 Comandos: energia, emergencia y Safe Restart (TBC 10.g)
     # -------------------------------------------------------------------
-
-    def execute(self, command, params):
-        """Ejecuta un comando. Devuelve (codigo_http, payload)."""
-        with self._lock:
-            self.last_contact_ts = time.time()
-            command = str(command).strip().lower()
-            params = params if isinstance(params, dict) else {}
-
-            handler = self._commands.get(command)
-            if handler is None:
-                log_warn(f"Comando desconocido: '{command}'")
-                return 400, self._command_response(
-                    False,
-                    command,
-                    f"Comando desconocido '{command}'. Comandos validos: "
-                    f"{', '.join(sorted(self._commands))}.",
-                )
-
-            self.commands_received += 1
-            self.last_command = command
-            log_command(f"'{command}' params={json.dumps(params, ensure_ascii=False)} "
-                        f"[estado={self.state.value}]")
-            try:
-                ok, message = handler(params)
-            except (TypeError, ValueError) as exc:
-                log_warn(f"'{command}' con parametros invalidos: {exc}")
-                return 400, self._command_response(
-                    False, command, f"Parametros invalidos: {exc}"
-                )
-
-            if ok:
-                log_info(f"'{command}' ACEPTADO -> {message}")
-            else:
-                log_warn(f"'{command}' RECHAZADO -> {message}")
-            return (200 if ok else 409), self._command_response(ok, command, message)
-
-    def trigger_plc_estop(self, source="PLC"):
-        """Puente de parada de emergencia: fuerza E-STOPPED y confirma al PLC."""
-        with self._lock:
-            self.last_contact_ts = time.time()
-            already = self.state is State.E_STOPPED
-            if already:
-                self.estop_engaged = True
-                self._zero_actuators()
-                log_command(f"POST /api/plc/parada repetida desde {source} (ya en E-STOPPED)")
-            else:
-                log_command(f"POST /api/plc/parada desde {source} [estado={self.state.value}]")
-                self._set_state(
-                    State.E_STOPPED,
-                    f"parada de emergencia del controlador logico ({source})",
-                )
-            self._latest_telemetry = self._build_telemetry(time.time())
-            return {
-                "ok": True,
-                "confirmed": True,
-                "source": source,
-                "state": self.state.value,
-                "previous_state": self.previous_state.value,
-                "estop_engaged": True,
-                "actuators_zeroed": True,
-                "server_running": True,
-                "already_stopped": already,
-                "message": (
-                    "Parada de emergencia confirmada. Actuadores en 0; "
-                    "presiones, 6DOF y sensores siguen publicandose a 10 Hz."
-                ),
-                "timestamp": int(time.time()),
-            }
-
-    def _command_response(self, ok, command, message):
-        return {
-            "ok": ok,
-            "command": command,
-            "message": message,
-            "state": self.state.value,
-            "mining": self.state is State.MINING,
-            "estop_engaged": self.estop_engaged,
-            "active_interlocks": sorted(
-                key for key, lock in self.interlocks.items() if lock.active
-            ),
-            "latched_interlocks": self._latched_keys(),
-            "safe_restart": self._restart_status(),
-            "timestamp": int(time.time()),
-        }
-
-    # --- Energia, emergencia y reinicio seguro -------------------------
 
     def _mark_restart_step(self, step, note):
         """Registra un paso de la secuencia de reinicio seguro (2 acciones)."""
@@ -1224,9 +1949,7 @@ class BichoSimulator:
         if is_last:
             blocked = self._restart_blockers()
             if blocked:
-                return False, (
-                    "Rearme bloqueado: " + "; ".join(blocked)
-                )
+                return False, "Rearme bloqueado: " + "; ".join(blocked)
 
         self._restart_done.add(step)
         done, total = len(self._restart_done), len(sequence)
@@ -1247,7 +1970,9 @@ class BichoSimulator:
 
     def _restart_blockers(self):
         blockers = []
-        if self.estop_engaged:
+        if self._hardware_estop_pressed():
+            blockers.append("el hongo de emergencia FISICO sigue presionado")
+        elif self.estop_engaged:
             blockers.append("el hongo de emergencia sigue engachado (use 'reset_estop')")
         latched = self._latched_keys()
         if latched:
@@ -1280,6 +2005,11 @@ class BichoSimulator:
         )
 
     def _cmd_reset_estop(self, params):
+        if self._hardware_estop_pressed():
+            return False, (
+                "El hongo de emergencia FISICO sigue presionado: liberelo antes "
+                "de ejecutar 'reset_estop'."
+            )
         if self.state is not State.E_STOPPED:
             if self.estop_engaged:
                 self.estop_engaged = False
@@ -1298,18 +2028,11 @@ class BichoSimulator:
 
     def _cmd_clear_fault(self, params):
         # Retira primero las fallas inyectadas por el modo ingenieria.
-        self.forced_overload = False
-        self.bladder_leak = False
-        self.pump_stuck = False
-        self.forced_comms_loss = False
-        self.forced_sensor_battery_drain = False
-        self.forced_sensor_signal_loss = False
-        if self.bladder_sensor_battery_pct < 40.0:
-            self.bladder_sensor_battery_pct = BLADDER_SENSOR_BATTERY_START
-        self.bladder_sensor_link_ok = True
-        self.bladder_sensor_signal_ms = BLADDER_SENSOR_SIGNAL_BASE_MS
-        self.last_contact_ts = time.time()
+        if isinstance(self._hw, IFaultInjectionPort):
+            self._hw.clear_injected_faults()
         self._overload_timer = 0.0
+        self._prop_overload_timer = 0.0
+        self._acquire(self._clock())        # lecturas frescas para reevaluar
 
         blocking = []
         cleared = []
@@ -1387,7 +2110,7 @@ class BichoSimulator:
     def _preconditions(self, target):
         latched = self._latched_keys()
         if target in (State.READY, State.MINING):
-            if self.estop_engaged:
+            if self.estop_engaged or self._hw_estop_now:
                 return False, "El hongo de emergencia sigue engachado."
             if latched:
                 return False, (
@@ -1401,9 +2124,10 @@ class BichoSimulator:
                     f"{CUTTERHEAD_RPM_MIN_MINING:.1f} rpm de consigna "
                     "(ejecute 'start_cutterhead')."
                 )
-            if self.bladder_pressure < BLADDER_P_MIN:
+            pressure = self._sensed("bladder_pressure_bar")
+            if pressure < BLADDER_P_MIN:
                 return False, (
-                    f"Vejiga sin agarre: P {self.bladder_pressure:.2f} bar < "
+                    f"Vejiga sin agarre: P {pressure:.2f} bar < "
                     f"P_min {BLADDER_P_MIN:.2f} bar (ejecute 'inflate_bladder' y espere)."
                 )
         return True, ""
@@ -1440,6 +2164,8 @@ class BichoSimulator:
                 f"Solo se ajustan rpm en READY o MINING (estado actual {self.state.value})."
             )
         rpm = clamp(float(params["rpm"]), 0.0, CUTTERHEAD_RPM_MAX)
+        if rpm > 0.0 and self._inhibited(SUB_CUTTERHEAD):
+            return False, "Cabezal inhabilitado por un interlock enganchado."
         self.cutterhead_rpm_target = rpm
         if rpm <= 0.0:
             return self._cmd_stop_cutterhead({})
@@ -1502,6 +2228,8 @@ class BichoSimulator:
             return False, (
                 f"La propulsion solo se ajusta en READY o MINING (estado {self.state.value})."
             )
+        if self._inhibited(SUB_PROPULSION):
+            return False, "Propulsion inhabilitada por un interlock enganchado."
         speed = clamp(float(params[key]), 0.0, PROPULSION_SPEED_MAX)
         self.propulsion_speed_target = speed
         return True, f"Consigna de propulsion en {speed:.2f} mm/min."
@@ -1533,126 +2261,60 @@ class BichoSimulator:
 
     def _cmd_simulate_fault(self, params):
         raw = str(params.get("fault", params.get("type", "generic"))).strip().lower()
-        aliases = {
-            "overload": "cutterhead_overload",
-            "cutterhead": "cutterhead_overload",
-            "cutterhead_overload": "cutterhead_overload",
-            "underpressure": "bladder_underpressure",
-            "leak": "bladder_underpressure",
-            "bladder_underpressure": "bladder_underpressure",
-            "overpressure": "bladder_overpressure",
-            "bladder_overpressure": "bladder_overpressure",
-            "comms": "comms_loss",
-            "network": "comms_loss",
-            "comms_loss": "comms_loss",
-            "wireless": "bladder_sensor",
-            "bladder_sensor": "bladder_sensor",
-            "sensor": "bladder_sensor",
-            "battery": "bladder_sensor_battery",
-            "bladder_sensor_battery": "bladder_sensor_battery",
-            "signal": "bladder_sensor_signal",
-            "bladder_sensor_signal": "bladder_sensor_signal",
-            "generic": "generic",
-            "critical": "generic",
-        }
-        fault = aliases.get(raw)
-        if fault is None:
+
+        if raw in ("generic", "critical"):
+            if self.state in (State.POWER_OFF, State.E_STOPPED):
+                return False, f"No hay actuacion que abortar en {self.state.value}."
+            reason = str(params.get("reason", "falla critica simulada por el operador"))
+            log_interlock(f"Falla critica generica inyectada: {reason}")
+            self._set_state(State.FAULT, reason)
+            return True, "Maquina en FAULT. Use 'clear_fault' + 'arm' para recuperarla."
+
+        if not isinstance(self._hw, IFaultInjectionPort):
             return False, (
-                f"Falla desconocida '{raw}'. Validas: cutterhead_overload, "
-                "bladder_underpressure, bladder_overpressure, comms_loss, "
-                "bladder_sensor, bladder_sensor_battery, bladder_sensor_signal, generic."
+                f"El adaptador {self.adapter_name} no admite inyeccion de fallas "
+                "(solo hardware simulado)."
             )
-
-        if fault == "cutterhead_overload":
-            self.forced_overload = True
-            log_interlock("Falla inyectada: sobrecarga en el cabezal de corte.")
-            note = "" if self.cutterhead_rpm > 0 else " (se manifestara al arrancar el cabezal)"
-            return True, f"Sobrecarga inyectada; el interlock disparara solo{note}."
-
-        if fault == "bladder_underpressure":
-            self.bladder_leak = True
-            log_interlock("Falla inyectada: fuga en la vejiga de propulsion.")
-            return True, "Fuga inyectada; la presion caera por debajo de P_min."
-
-        if fault == "bladder_overpressure":
-            self.pump_stuck = True
-            log_interlock("Falla inyectada: valvula de inflado trabada (sobrepresion).")
-            return True, "Bomba trabada inyectada; la presion superara P_max."
-
-        if fault == "comms_loss":
-            self.forced_comms_loss = True
-            log_interlock("Falla inyectada: perdida de comunicacion de red.")
-            return True, "Perdida de red simulada; se ejecutara el aborto global."
-
-        if fault == "bladder_sensor_battery":
-            self.forced_sensor_battery_drain = True
-            log_interlock("Falla inyectada: descarga acelerada de bateria del sensor inalambrico.")
-            return True, "La bateria del sensor caera hasta el umbral critico y disparara FAULT."
-
-        if fault == "bladder_sensor_signal":
-            self.forced_sensor_signal_loss = True
-            log_interlock("Falla inyectada: perdida de enlace del sensor inalambrico de vejiga.")
-            return True, "Enlace del sensor perdido; el interlock llevara la maquina a FAULT."
-
-        if fault == "bladder_sensor":
-            self.forced_sensor_signal_loss = True
-            log_interlock("Falla inyectada: sensor inalambrico de vejiga (enlace + bateria).")
-            return True, "Sensor inalambrico fuera de servicio; la maquina pasara a FAULT."
-
-        if self.state in (State.POWER_OFF, State.E_STOPPED):
-            return False, f"No hay actuacion que abortar en {self.state.value}."
-        reason = str(params.get("reason", "falla critica simulada por el operador"))
-        log_interlock(f"Falla critica generica inyectada: {reason}")
-        self._set_state(State.FAULT, reason)
-        return True, "Maquina en FAULT. Use 'clear_fault' + 'arm' para recuperarla."
+        return self._hw.inject_fault(raw, params)
 
     def _cmd_heartbeat(self, params):
         return True, "Latido recibido; watchdog de comunicaciones refrescado."
 
     def _cmd_set_bladder_sensor(self, params):
         """Ajusta bateria/señal del sensor inalambrico para pruebas de filtros."""
-        if "battery_percent" in params:
-            self.bladder_sensor_battery_pct = clamp(float(params["battery_percent"]), 0.0, 100.0)
-            self.forced_sensor_battery_drain = False
-        if "signal_ms" in params:
-            self.bladder_sensor_signal_ms = max(0.0, float(params["signal_ms"]))
-            self.forced_sensor_signal_loss = (
-                self.bladder_sensor_signal_ms >= BLADDER_SENSOR_SIGNAL_LOST_MS
+        if not isinstance(self._hw, IFaultInjectionPort):
+            return False, f"El adaptador {self.adapter_name} no admite este comando."
+        return self._hw.set_wireless_sensor(params)
+
+    def _cmd_hardware_estop(self, params):
+        """Simula presionar/liberar el hongo de emergencia FISICO."""
+        if not isinstance(self._hw, IFaultInjectionPort):
+            return False, f"El adaptador {self.adapter_name} no admite este comando."
+        pressed = bool(params.get("pressed", True))
+        self._hw.set_hardware_estop(pressed)
+        self._hw_estop_now = self._hardware_estop_pressed()
+        self._handle_hardware_estop()
+        if pressed:
+            return True, (
+                "Hongo FISICO presionado: E-STOPPED inmediato. Libere el hongo y luego "
+                "ejecute 'reset_estop' + 'arm'."
             )
-            self.bladder_sensor_link_ok = not self.forced_sensor_signal_loss
-        if "link_ok" in params:
-            self.forced_sensor_signal_loss = not bool(params["link_ok"])
-            self.bladder_sensor_link_ok = not self.forced_sensor_signal_loss
-            if self.forced_sensor_signal_loss:
-                self.bladder_sensor_signal_ms = BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
         return True, (
-            f"Sensor inalambrico: bateria {self.bladder_sensor_battery_pct:.1f} %, "
-            f"señal {self.bladder_sensor_signal_ms:.1f} ms, "
-            f"enlace={'ok' if self.bladder_sensor_link_ok else 'perdido'}."
+            "Hongo FISICO liberado. La maquina sigue en E-STOPPED hasta completar "
+            "'reset_estop' + 'arm'."
         )
 
-    # --- Uplink de telemetria ------------------------------------------
-
-    def register_uplink_result(self, ok, detail=""):
-        with self._lock:
-            if ok:
-                self.uplink_ok = True
-                self.uplink_failures = 0
-                self.last_contact_ts = time.time()
-                return
-            self.uplink_ok = False
-            self.uplink_failures += 1
-            if self.uplink_failures == UPLINK_MAX_FAILURES and not self.forced_comms_loss:
-                log_net(
-                    f"{self.uplink_failures} envios de telemetria fallidos consecutivos "
-                    f"({detail}): se declara perdida de comunicacion."
-                )
-                self.forced_comms_loss = True
-
 
 # =========================================================================
-# 5. DOCUMENTACION DE LA API (se sirve en GET /)
+# CAPA 4 - PRESENTACION / API (telemetria y comunicaciones de competencia)
 # =========================================================================
+# Unica capa que conoce HTTP, JSON y aiohttp. Solo consume la API publica
+# del nucleo (`snapshot()`, `execute()`, `trigger_plc_estop()`...).
+
+TBC_ROOT_KEYS = (
+    "team", "timestamp", "mining", "chainage",
+    "easting", "northing", "elevation", "roll", "pitch", "heading", "extra",
+)
 
 COMMAND_HELP = {
     "power_on": "Aplica la energia principal. Paso 1/2 del reinicio seguro desde POWER OFF.",
@@ -1672,302 +2334,496 @@ COMMAND_HELP = {
     "inflate_bladder": "Presuriza la vejiga de propulsion. Params: {'target_bar': 0-2.6}.",
     "deflate_bladder": "Despresuriza la vejiga (suspende la excavacion).",
     "simulate_fault": "Inyecta una falla para probar alarmas. Params: {'fault': "
-                      "'cutterhead_overload|bladder_underpressure|bladder_overpressure|"
-                      "comms_loss|bladder_sensor|bladder_sensor_battery|"
-                      "bladder_sensor_signal|generic'}.",
+                      "'cutterhead_overload|propulsion_overload|bladder_underpressure|"
+                      "bladder_overpressure|comms_loss|bladder_sensor|"
+                      "bladder_sensor_battery|bladder_sensor_signal|hardware_estop|generic'}.",
     "heartbeat": "Refresca el watchdog de comunicaciones sin alterar la maquina.",
     "set_bladder_sensor": "Ajusta el sensor inalambrico. Params: {'battery_percent': 0-100, "
                           "'signal_ms': n, 'link_ok': true|false}.",
+    "hardware_estop": "Simula el hongo de emergencia FISICO. Params: {'pressed': true|false}.",
 }
 
 
-def api_help():
-    return {
-        "service": "B.I.C.H.O. Digital Twin",
-        "team": TEAM_NAME,
-        "version": VERSION,
-        "endpoints": {
-            "GET /": "Esta ayuda.",
-            "GET /health": "Resumen corto de estado y seguridad.",
-            "GET /telemetry": "Telemetria completa en el formato exigido por TBC (sample a 10 Hz).",
-            "POST /command": "Modo manual/ingenieria: {'command': nombre, 'params': {...}}.",
-            "POST /tbc_endpoint": "Receptor simulado de telemetria de The Boring Company.",
-            "POST /api/plc/parada": "Puente PLC: fuerza E-STOPPED y responde 200 de confirmacion.",
-        },
-        "states": [state.value for state in State],
-        "allowed_transitions": {
-            state.value: sorted(target.value for target in targets)
-            for state, targets in ALLOWED_TRANSITIONS.items()
-        },
-        "safe_restart": {
-            state.value: {"independent_actions_required": len(sequence), "sequence": list(sequence)}
-            for state, sequence in RESTART_SEQUENCES.items()
-        },
-        "interlocks": {
-            "cutterhead_overload": f"Carga > {CUTTERHEAD_LOAD_MAX_PCT:.0f} % o corriente > "
-                                   f"{CUTTERHEAD_CURRENT_MAX_A:.0f} A durante "
-                                   f"{OVERLOAD_DEBOUNCE_S:.1f} s: detiene cabezal y propulsion.",
-            "bladder_underpressure": f"P_vejiga < {BLADDER_P_MIN:.2f} bar: deshabilita la propulsion.",
-            "bladder_overpressure": f"P_vejiga > {BLADDER_P_MAX:.2f} bar: detiene el inflado, "
-                                    "abre el alivio y deshabilita la propulsion.",
-            "comms_loss": f"Sin trafico durante mas de {COMMS_TIMEOUT_S:.0f} s en READY/MINING: "
-                          "aborto global de la actuacion.",
-            "bladder_sensor": (
-                f"Bateria del sensor inalambrico <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} % "
-                f"o señal >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms: maquina a FAULT."
-            ),
-        },
-        "commands": COMMAND_HELP,
-        "startup_sequence": [
-            "power_on", "arm", "set_state READY", "inflate_bladder",
-            "start_cutterhead", "set_state MINING",
-        ],
-    }
+class TelemetryPresenter:
+    """Convierte un `ControllerSnapshot` en el JSON obligatorio de TBC.
 
+    El JSON de `/telemetry` es la unica fuente de verdad de la GUI del
+    operador: la raiz contiene exactamente las llaves exigidas y el bloque
+    `extra` agrupa todos los estados de subsistemas.
+    """
 
-# =========================================================================
-# 6. SERVIDOR HTTP
-# =========================================================================
+    def telemetry(self, snap):
+        s = snap.sensors
+        return {
+            "team": TEAM_NAME,
+            "timestamp": int(snap.wall_time),
+            "mining": snap.state is State.MINING,
+            "chainage": round(s["chainage_m"], 3),
+            "easting": round(s["easting_m"], 3),
+            "northing": round(s["northing_m"], 3),
+            "elevation": round(s["elevation_m"], 3),
+            "roll": round(s["roll_deg"], 3),
+            "pitch": round(s["pitch_deg"], 3),
+            "heading": round(s["heading_deg"], 3),
+            "extra": self._extra(snap),
+        }
 
-class BichoRequestHandler(BaseHTTPRequestHandler):
-    """Handler REST del gemelo digital."""
+    def _extra(self, snap):
+        s = snap.sensors
+        now = snap.wall_time
+        comms = snap.comms
+        gripped = s["bladder_pressure_bar"] >= BLADDER_P_MIN
+        return {
+            # --- Claves planas (compatibilidad con el dashboard actual) ---
+            "cutterhead_rpm": round(s["cutterhead_rpm"], 2),
+            "cutterhead_load_percent": round(s["cutterhead_load_pct"], 1),
+            "bladder_pressure_bar": round(s["bladder_pressure_bar"], 3),
+            "hydroshield_pressure_bar": round(s["hydroshield_pressure_bar"], 3),
+            "propulsion_speed_mm_min": round(s["propulsion_speed_mm_min"], 2),
+            "bladder_sensor_battery_percent": round(s["bladder_sensor_battery_pct"], 1),
+            "bladder_sensor_signal_ms": round(s["bladder_sensor_signal_ms"], 1),
 
-    server_version = f"BICHO-DigitalTwin/{VERSION}"
-    protocol_version = "HTTP/1.1"
-    simulator = None                 # inyectado en main()
+            # --- Maquina de estados ---
+            "state": snap.state.value,
+            "previous_state": snap.previous_state.value,
+            "state_elapsed_s": round(snap.state_elapsed_s, 1),
+            "timestamp_iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(now)) + "Z",
+            "timestamp_unix_ms": int(now * 1000),
+            "sample_hz": TICK_HZ,
+            "sample_index": snap.sample_index,
 
-    # --- Helpers -------------------------------------------------------
+            "cutterhead": {
+                "running": snap.cutterhead_running,
+                "rpm": round(s["cutterhead_rpm"], 2),
+                "rpm_setpoint": round(snap.cutterhead_rpm_setpoint, 2),
+                "load_percent": round(s["cutterhead_load_pct"], 1),
+                "current_a": round(s["cutterhead_current_a"], 2),
+                "torque_nm": round(s["cutterhead_torque_nm"], 1),
+                "motor_temp_c": round(s["cutterhead_temp_c"], 1),
+                "load_limit_percent": CUTTERHEAD_LOAD_MAX_PCT,
+                "current_limit_a": CUTTERHEAD_CURRENT_MAX_A,
+                "inhibited": snap.inhibited[SUB_CUTTERHEAD],
+            },
+            "propulsion": {
+                "enabled": snap.propulsion_enabled,
+                "speed_mm_min": round(s["propulsion_speed_mm_min"], 2),
+                "speed_setpoint_mm_min": round(snap.propulsion_speed_setpoint, 2),
+                "track_left_mm_min": round(s["track_left_mm_min"], 2),
+                "track_right_mm_min": round(s["track_right_mm_min"], 2),
+                "thrust_force_kn": round(s["thrust_force_kn"], 2),
+                "motor_temp_c": round(s["propulsion_temp_c"], 1),
+                "load_percent": round(s["propulsion_load_pct"], 1),
+                "current_a": round(s["propulsion_current_a"], 2),
+                "load_limit_percent": PROPULSION_LOAD_MAX_PCT,
+                "current_limit_a": PROPULSION_CURRENT_MAX_A,
+                "inhibited": snap.inhibited[SUB_PROPULSION],
+            },
+            "bladder": {
+                "pressure_bar": round(s["bladder_pressure_bar"], 3),
+                "setpoint_bar": round(snap.bladder_setpoint_bar, 3),
+                "p_min_bar": BLADDER_P_MIN,
+                "p_max_bar": BLADDER_P_MAX,
+                "inflating": snap.bladder_inflating,
+                "relief_valve_open": snap.relief_valve_open,
+                "gripped": gripped,
+                "wireless_sensor": {
+                    "battery_percent": round(s["bladder_sensor_battery_pct"], 1),
+                    "signal_ms": round(s["bladder_sensor_signal_ms"], 1),
+                    "link_ok": s["bladder_sensor_link_ok"],
+                    "battery_critical_percent": BLADDER_SENSOR_BATTERY_CRITICAL_PCT,
+                    "signal_lost_ms": BLADDER_SENSOR_SIGNAL_LOST_MS,
+                },
+            },
+            "steering": {
+                "motor_a_mm": round(s["steer_a_mm"], 2),
+                "motor_b_mm": round(s["steer_b_mm"], 2),
+                "motor_a_setpoint_mm": round(snap.steer_a_setpoint_mm, 2),
+                "motor_b_setpoint_mm": round(snap.steer_b_setpoint_mm, 2),
+                "stroke_limit_mm": STEER_STROKE_MM,
+                "yaw_rate_deg_s": round(s["yaw_rate_deg_s"], 4),
+                "inhibited": snap.inhibited[SUB_STEERING],
+            },
+            "navigation": {
+                "advance_rate_mm_min": round(s["propulsion_speed_mm_min"], 2),
+                "chainage_m": round(s["chainage_odometry_m"], 3),
+                "mined_length_m": round(snap.mined_length_m, 3),
+                "mining_time_s": round(snap.mining_time_s, 1),
+                "ground_hardness_index": round(s["ground_hardness_index"], 3),
+            },
+            "safety": {
+                "estop_engaged": snap.estop_engaged,
+                "hardware_estop": snap.hardware_estop,
+                "active_interlocks": snap.active_interlocks,
+                "latched_interlocks": snap.latched_interlocks,
+                "interlocks": snap.interlocks,
+                "safe_restart": snap.safe_restart,
+                "allowed_transitions": snap.allowed_transitions,
+            },
+            "comms": {
+                "ok": comms["ok"],
+                "seconds_since_last_contact": round(comms["seconds_since_last_contact"], 2),
+                "timeout_s": comms["timeout_s"],
+                "uplink_ok": comms["uplink_ok"],
+                "uplink_failures": comms["uplink_failures"],
+                "uplink_sent": comms["uplink_sent"],
+                "network_healthy": comms["network_healthy"],
+                "io_ok": comms["io_ok"],
+                "watchdog_armed_links": comms["watchdog_armed_links"],
+                "watchdog_silence_s": round(comms["watchdog_silence_s"], 2),
+            },
+            "sim": {
+                "version": VERSION,
+                "adapter": snap.adapter,
+                "tick_hz": TICK_HZ,
+                "uptime_s": round(snap.uptime_s, 1),
+                "commands_received": snap.commands_received,
+                "last_command": snap.last_command,
+                "injected_faults": snap.injected_faults,
+            },
+        }
 
-    def _send_json(self, code, payload):
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.end_headers()
-        if self.command != "HEAD":
-            self.wfile.write(body)
+    def command_response(self, result):
+        return {
+            "ok": result.ok,
+            "command": result.command,
+            "message": result.message,
+            "state": result.state.value,
+            "mining": result.mining,
+            "estop_engaged": result.estop_engaged,
+            "active_interlocks": result.active_interlocks,
+            "latched_interlocks": result.latched_interlocks,
+            "safe_restart": result.safe_restart,
+            "timestamp": result.timestamp,
+        }
 
-    def _drain_body(self):
-        """Consume el cuerpo para no desincronizar una conexion keep-alive."""
-        try:
-            remaining = min(int(self.headers.get("Content-Length") or 0), 1_000_000)
-        except ValueError:
-            remaining = 0
-        while remaining > 0:
-            chunk = self.rfile.read(min(65536, remaining))
-            if not chunk:
-                break
-            remaining -= len(chunk)
+    def estop_response(self, result):
+        return {
+            "ok": True,
+            "confirmed": True,
+            "source": result.source,
+            "state": result.state.value,
+            "previous_state": result.previous_state.value,
+            "estop_engaged": result.estop_engaged,
+            "actuators_zeroed": result.actuators_zeroed,
+            "server_running": True,
+            "already_stopped": result.already_stopped,
+            "message": result.message,
+            "timestamp": result.timestamp,
+        }
 
-    def _read_json_body(self):
-        """Devuelve (dict, None) o (None, mensaje_de_error)."""
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-        except ValueError:
-            self.close_connection = True
-            return None, "Cabecera Content-Length invalida."
-        if length <= 0:
-            return None, "Cuerpo vacio: se espera un objeto JSON."
-        if length > 1_000_000:
-            self.close_connection = True
-            return None, "Cuerpo demasiado grande."
-        raw = self.rfile.read(length)
-        try:
-            body = json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-            return None, f"JSON invalido: {exc}"
-        if not isinstance(body, dict):
-            return None, "El JSON debe ser un objeto, por ejemplo {\"command\": \"arm\"}."
-        return body, None
+    def health(self, snap):
+        return {
+            "ok": True,
+            "team": TEAM_NAME,
+            "state": snap.state.value,
+            "mining": snap.state is State.MINING,
+            "estop_engaged": snap.estop_engaged,
+            "latched_interlocks": snap.latched_interlocks,
+            "safe_restart": snap.safe_restart,
+            "uptime_s": round(snap.uptime_s, 1),
+        }
 
-    @property
-    def route(self):
-        return self.path.split("?", 1)[0].rstrip("/") or "/"
-
-    # --- Verbos HTTP ---------------------------------------------------
-
-    def do_OPTIONS(self):
-        self.send_response(204)
-        self.send_header("Content-Length", "0")
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
-        self.send_header("Access-Control-Max-Age", "86400")
-        self.end_headers()
-
-    def do_GET(self):
-        sim = self.simulator
-        route = self.route
-
-        if route == "/telemetry":
-            sim.touch_comms()
-            self._send_json(200, sim.telemetry())
-        elif route in ("/", "/help"):
-            self._send_json(200, api_help())
-        elif route in ("/health", "/status", "/state"):
-            self._send_json(200, sim.status_summary())
-        else:
-            self._send_json(404, {
-                "ok": False,
-                "error": f"Ruta no encontrada: {self.path}",
-                "hint": "Use GET /telemetry, GET / o POST /command.",
-            })
-
-    def do_HEAD(self):
-        self.do_GET()
-
-    def do_POST(self):
-        sim = self.simulator
-        route = self.route
-
-        if route == "/command":
-            body, error = self._read_json_body()
-            if error:
-                log_warn(f"POST /command rechazado: {error}")
-                self._send_json(400, {"ok": False, "error": error, "commands": sorted(COMMAND_HELP)})
-                return
-            command = body.get("command", body.get("cmd", body.get("action")))
-            if command is None:
-                self._send_json(400, {
-                    "ok": False,
-                    "error": "Falta la llave 'command'.",
-                    "example": {"command": "set_state", "params": {"state": "READY"}},
-                    "commands": sorted(COMMAND_HELP),
-                })
-                return
-            params = body.get("params")
-            if not isinstance(params, dict):
-                params = {
-                    key: value
-                    for key, value in body.items()
-                    if key not in ("command", "cmd", "action", "params")
+    def api_help(self):
+        return {
+            "service": "B.I.C.H.O. Supervisory Controller / Digital Twin",
+            "team": TEAM_NAME,
+            "version": VERSION,
+            "architecture": {
+                "ports": "IHardwareAdapter (read_sensors, write_actuators, "
+                         "check_network_health, is_hardware_estop_triggered)",
+                "adapters": "SimulatedHardwareAdapter",
+                "core": "TBMController (lazo de control no bloqueante a 10 Hz)",
+                "presentation": "aiohttp + cliente POST hacia TBC",
+            },
+            "endpoints": {
+                "GET /": "Esta ayuda.",
+                "GET /health": "Resumen corto de estado y seguridad.",
+                "GET /telemetry": "Telemetria completa en el formato exigido por TBC (sample a 10 Hz).",
+                "POST /command": "Modo manual/ingenieria: {'command': nombre, 'params': {...}}.",
+                "POST /tbc_endpoint": "Receptor simulado de telemetria de The Boring Company.",
+                "POST /api/plc/parada": "Puente PLC: fuerza E-STOPPED y responde 200 de confirmacion.",
+            },
+            "states": [state.value for state in State],
+            "allowed_transitions": {
+                state.value: sorted(target.value for target in targets)
+                for state, targets in ALLOWED_TRANSITIONS.items()
+            },
+            "safe_restart": {
+                state.value: {
+                    "independent_actions_required": len(sequence),
+                    "sequence": list(sequence),
                 }
-            code, payload = sim.execute(command, params)
-            self._send_json(code, payload)
-            return
+                for state, sequence in RESTART_SEQUENCES.items()
+            },
+            "interlocks": {
+                "cutterhead_overload": f"Carga > {CUTTERHEAD_LOAD_MAX_PCT:.0f} % o corriente > "
+                                       f"{CUTTERHEAD_CURRENT_MAX_A:.0f} A durante "
+                                       f"{OVERLOAD_DEBOUNCE_S:.1f} s: detiene cabezal y propulsion (FAULT).",
+                "propulsion_overload": f"Carga > {PROPULSION_LOAD_MAX_PCT:.0f} % o corriente > "
+                                       f"{PROPULSION_CURRENT_MAX_A:.0f} A durante "
+                                       f"{OVERLOAD_DEBOUNCE_S:.1f} s: detiene la propulsion.",
+                "bladder_underpressure": f"P_vejiga < {BLADDER_P_MIN:.2f} bar: deshabilita la propulsion.",
+                "bladder_overpressure": f"P_vejiga > {BLADDER_P_MAX:.2f} bar: detiene el inflado, "
+                                        "abre el alivio y deshabilita la propulsion (FAULT).",
+                "comms_loss": "Watchdog: un enlace armado (red del hardware, estacion del operador en "
+                              "READY/MINING, enlace TBC) sin señales de vida durante mas de "
+                              f"{WATCHDOG_TIMEOUT_S:.0f} s: aborto global (FAULT).",
+                "bladder_sensor": (
+                    f"Bateria del sensor inalambrico <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} % "
+                    f"o señal >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms: maquina a FAULT."
+                ),
+            },
+            "commands": COMMAND_HELP,
+            "startup_sequence": [
+                "power_on", "arm", "set_state READY", "inflate_bladder",
+                "start_cutterhead", "set_state MINING",
+            ],
+        }
 
-        if route == "/tbc_endpoint":
-            body, error = self._read_json_body()
-            if error:
-                self._send_json(400, {"status": "error", "message": error})
-                return
-            sim.touch_comms()
+
+# --- Utilidades HTTP -----------------------------------------------------
+
+CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization",
+}
+
+MAX_BODY_BYTES = 1_000_000
+
+HTTP_STATUS_BY_OUTCOME = {
+    CommandOutcome.ACCEPTED: 200,
+    CommandOutcome.REJECTED: 409,
+    CommandOutcome.INVALID: 400,
+}
+
+
+def json_response(payload, status=200):
+    body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    return web.Response(
+        body=body,
+        status=status,
+        content_type="application/json",
+        charset="utf-8",
+        headers={"Cache-Control": "no-store"},
+    )
+
+
+async def read_json_body(request, required=True):
+    """Devuelve (dict, None) o (None, mensaje_de_error)."""
+    raw = await request.read()
+    if not raw.strip():
+        if required:
+            return None, "Cuerpo vacio: se espera un objeto JSON."
+        return {}, None
+    try:
+        body = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        return None, f"JSON invalido: {exc}"
+    if not isinstance(body, dict):
+        return None, "El JSON debe ser un objeto, por ejemplo {\"command\": \"arm\"}."
+    return body, None
+
+
+if web is not None:
+
+    @web.middleware
+    async def http_envelope(request, handler):
+        """CORS, preflight OPTIONS y errores siempre en JSON."""
+        if request.method == "OPTIONS":
+            return web.Response(
+                status=204,
+                headers={**CORS_HEADERS, "Access-Control-Max-Age": "86400"},
+            )
+        try:
+            response = await handler(request)
+        except web.HTTPException as exc:
+            if exc.status == 404:
+                response = json_response({
+                    "ok": False,
+                    "error": f"Ruta no encontrada: {request.path_qs}",
+                    "hint": "Use GET /telemetry, GET / o POST /command.",
+                }, 404)
+            else:
+                response = json_response(
+                    {"ok": False, "error": exc.reason or "Error HTTP"}, exc.status
+                )
+        except Exception as exc:                    # nunca tumbar el servidor
+            log_warn(f"Error interno en {request.method} {request.path}: {exc!r}")
+            response = json_response(
+                {"ok": False, "error": "Error interno del servidor."}, 500
+            )
+        response.headers.update(CORS_HEADERS)
+        return response
+
+
+class TelemetryApi:
+    """Handlers REST. Solo traducen HTTP <-> API publica del nucleo."""
+
+    def __init__(self, controller, presenter):
+        self._controller = controller
+        self._presenter = presenter
+        self.tbc_packets = 0
+
+    async def root(self, request):
+        return json_response(self._presenter.api_help())
+
+    async def health(self, request):
+        return json_response(self._presenter.health(self._controller.snapshot()))
+
+    async def telemetry(self, request):
+        self._controller.touch_operator()
+        return json_response(self._presenter.telemetry(self._controller.snapshot()))
+
+    async def command(self, request):
+        body, error = await read_json_body(request)
+        if error:
+            log_warn(f"POST /command rechazado: {error}")
+            return json_response(
+                {"ok": False, "error": error, "commands": sorted(COMMAND_HELP)}, 400
+            )
+        command = body.get("command", body.get("cmd", body.get("action")))
+        if command is None:
+            return json_response({
+                "ok": False,
+                "error": "Falta la llave 'command'.",
+                "example": {"command": "set_state", "params": {"state": "READY"}},
+                "commands": sorted(COMMAND_HELP),
+            }, 400)
+        params = body.get("params")
+        if not isinstance(params, dict):
+            params = {
+                key: value
+                for key, value in body.items()
+                if key not in ("command", "cmd", "action", "params")
+            }
+        result = self._controller.execute(command, params)
+        return json_response(
+            self._presenter.command_response(result), HTTP_STATUS_BY_OUTCOME[result.outcome]
+        )
+
+    async def tbc_endpoint(self, request):
+        """Receptor simulado de The Boring Company."""
+        body, error = await read_json_body(request)
+        if error:
+            return json_response({"status": "error", "message": error}, 400)
+        self.tbc_packets += 1
+        missing = [key for key in TBC_ROOT_KEYS if key not in body]
+        if missing:
+            log_warn(f"Paquete TBC #{self.tbc_packets} incompleto, faltan: {', '.join(missing)}")
+        elif self.tbc_packets == 1 or self.tbc_packets % 10 == 0:
             log_net(
-                "📦 Paquete de telemetria recibido por el receptor TBC simulado "
-                f"(team={body.get('team')}, chainage={body.get('chainage')}, "
+                f"📦 Paquete de telemetria #{self.tbc_packets} recibido por el receptor TBC "
+                f"simulado (team={body.get('team')}, chainage={body.get('chainage')}, "
                 f"mining={body.get('mining')})."
             )
-            self._send_json(200, {"status": "success", "message": "Telemetry received by TBC"})
-            return
+        return json_response({"status": "success", "message": "Telemetry received by TBC"})
 
-        if route in ("/api/plc/parada", "/api/plc/estop"):
-            source = "PLC"
-            try:
-                length = int(self.headers.get("Content-Length") or 0)
-            except ValueError:
-                length = 0
-            if length > 0:
-                body, error = self._read_json_body()
-                if error:
-                    self._send_json(400, {"ok": False, "error": error})
-                    return
-                source = str(body.get("source", body.get("origin", "PLC")))
-            payload = sim.trigger_plc_estop(source=source)
-            self._send_json(200, payload)
-            return
-
-        self._drain_body()
-        self._send_json(404, {"ok": False, "error": f"Ruta no encontrada: {self.path}"})
-
-    def log_message(self, fmt, *args):
-        """Silencia el log de accesos de http.server (usamos el nuestro)."""
-        return
+    async def plc_estop(self, request):
+        body, error = await read_json_body(request, required=False)
+        if error:
+            return json_response({"ok": False, "error": error}, 400)
+        source = str(body.get("source", body.get("origin", "PLC")))
+        result = self._controller.trigger_plc_estop(source=source)
+        return json_response(self._presenter.estop_response(result))
 
 
-# =========================================================================
-# 7. HILOS DE FONDO
-# =========================================================================
+def create_app(controller, presenter):
+    """Construye la aplicacion aiohttp (servidor local asincrono)."""
+    api = TelemetryApi(controller, presenter)
+    app = web.Application(middlewares=[http_envelope], client_max_size=MAX_BODY_BYTES)
 
-class SimulationLoop(threading.Thread):
-    """Ejecuta la fisica del gemelo digital a TICK_HZ."""
-
-    def __init__(self, simulator, stop_event):
-        super().__init__(name="sim-loop", daemon=True)
-        self.simulator = simulator
-        self.stop_event = stop_event
-
-    def run(self):
-        period = TICK_PERIOD_S
-        next_tick = time.perf_counter()
-        while not self.stop_event.is_set():
-            try:
-                self.simulator.tick(period)
-            except Exception as exc:                       # el lazo nunca debe morir
-                log_warn(f"Error en el lazo de simulacion: {exc!r}")
-            next_tick += period
-            sleep_s = next_tick - time.perf_counter()
-            if sleep_s > 0.0:
-                self.stop_event.wait(sleep_s)
+    def add(method, path, handler):
+        for variant in {path, path.rstrip("/") or "/", path.rstrip("/") + "/"}:
+            if method == "GET":
+                app.router.add_get(variant, handler)     # incluye HEAD
             else:
-                next_tick = time.perf_counter()
+                app.router.add_post(variant, handler)
+
+    add("GET", "/", api.root)
+    add("GET", "/help", api.root)
+    for alias in ("/health", "/status", "/state"):
+        add("GET", alias, api.health)
+    add("GET", "/telemetry", api.telemetry)
+    add("POST", "/command", api.command)
+    add("POST", "/tbc_endpoint", api.tbc_endpoint)
+    add("POST", "/api/plc/parada", api.plc_estop)
+    add("POST", "/api/plc/estop", api.plc_estop)
+    app["api"] = api
+    return app
 
 
-class TelemetryUplink(threading.Thread):
-    """Envia la telemetria por HTTP POST (cumplimiento >= 0.1 Hz)."""
+class TBCUplinkClient:
+    """Cliente TBC: tarea asincrona que hace POST de la telemetria a un
+    servidor externo a >= 0.1 Hz (Regla 7 de TBC)."""
 
-    def __init__(self, simulator, url, hz, stop_event, token=None):
-        super().__init__(name="telemetry-uplink", daemon=True)
-        self.simulator = simulator
-        self.url = url
-        self.period = 1.0 / max(0.01, hz)
-        self.stop_event = stop_event
-        self.token = token
+    MIN_HZ = 0.1
+    REQUEST_TIMEOUT_S = 5.0
 
-    def run(self):
-        log_net(f"Uplink de telemetria activo -> {self.url} cada {self.period:.1f} s.")
-        while not self.stop_event.is_set():
-            payload = json.dumps(self.simulator.telemetry()).encode("utf-8")
-            request = urllib.request.Request(
-                self.url,
-                data=payload,
-                method="POST",
-                headers={"Content-Type": "application/json"},
+    def __init__(self, controller, presenter, url, hz, token=None):
+        if hz < self.MIN_HZ:
+            raise ValueError(
+                f"El uplink no puede ser mas lento que {self.MIN_HZ} Hz (requisito TBC)."
             )
-            if self.token:
-                request.add_header("Authorization", f"Bearer {self.token}")
-            try:
-                with urllib.request.urlopen(request, timeout=5.0) as response:
-                    ok = 200 <= response.status < 300
-                    self.simulator.register_uplink_result(ok, f"HTTP {response.status}")
-            except (urllib.error.URLError, OSError, ValueError) as exc:
-                self.simulator.register_uplink_result(False, repr(exc))
-            self.stop_event.wait(self.period)
+        self._controller = controller
+        self._presenter = presenter
+        self.url = url
+        self.hz = float(hz)
+        self.period_s = 1.0 / self.hz
+        self._token = token
+
+    async def run(self):
+        log_net(
+            f"Cliente TBC activo -> {self.url} a {self.hz:g} Hz "
+            f"(cada {self.period_s:.1f} s; minimo TBC {self.MIN_HZ} Hz)."
+        )
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
+        timeout = aiohttp.ClientTimeout(total=min(self.REQUEST_TIMEOUT_S, 0.8 * self.period_s))
+        loop = asyncio.get_running_loop()
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            next_send = loop.time()
+            while True:
+                payload = self._presenter.telemetry(self._controller.snapshot())
+                try:
+                    async with session.post(self.url, json=payload) as response:
+                        await response.read()
+                        ok = 200 <= response.status < 300
+                        self._controller.register_uplink_result(ok, f"HTTP {response.status}")
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as exc:
+                    self._controller.register_uplink_result(False, repr(exc))
+                next_send += self.period_s
+                delay = next_send - loop.time()
+                if delay <= 0.0:
+                    next_send = loop.time()
+                    delay = 0.0
+                await asyncio.sleep(delay)
 
 
 # =========================================================================
-# 8. ARRANQUE
+# RAIZ DE COMPOSICION (unico lugar que conoce todas las capas)
 # =========================================================================
 
-def print_banner(host, port, simulator, uplink_url):
-    shown_host = host or "0.0.0.0"
-    base = f"http://localhost:{port}"
+def print_banner(args, controller, uplink_url):
+    shown_host = args.host or "0.0.0.0"
+    base = f"http://localhost:{args.port}"
     print("=" * 72)
-    print(f"🚀  GEMELO DIGITAL B.I.C.H.O.  v{VERSION}   |   {TEAM_NAME}")
+    print(f"🚀  B.I.C.H.O. SUPERVISORY CONTROLLER  v{VERSION}   |   {TEAM_NAME}")
     print("=" * 72)
-    print(f"🌐  Escuchando en {shown_host}:{port}   (lazo y telemetria a {TICK_HZ:.0f} Hz)")
+    print("🏗️   Arquitectura: Puertos -> Adaptadores -> Nucleo -> API (aiohttp)")
+    print(f"🔌  Hardware inyectado ...... {controller.adapter_name}")
+    print(f"🌐  Escuchando en {shown_host}:{args.port}   (lazo y telemetria a {TICK_HZ:.0f} Hz)")
     print(f"📡  Telemetria .............. GET  {base}/telemetry")
     print(f"🎛️   Modo manual/ingenieria .. POST {base}/command")
     print(f"🛑  Receptor TBC simulado ... POST {base}/tbc_endpoint")
     print(f"🚨  Parada PLC .............. POST {base}/api/plc/parada")
     print(f"📖  Ayuda de la API ......... GET  {base}/")
+    print(f"🐕  Watchdog de red ......... {controller.watchdog_timeout_s:.0f} s sin vida => FAULT")
     if uplink_url:
-        print(f"⬆️   Uplink de telemetria .... POST {uplink_url}")
+        print(f"⬆️   Cliente TBC ............. POST {uplink_url} a {args.uplink_hz:g} Hz")
+    else:
+        print("⚠️   Cliente TBC DESACTIVADO (--no-uplink): incumple la Regla 7 de TBC.")
     print("-" * 72)
-    print(f"🔐  Estado inicial: {simulator.state.value}")
+    print(f"🔐  Estado inicial: {controller.state.value}")
     print("    Secuencia de puesta en marcha (cada paso es un POST /command):")
     print("      1) power_on          2) arm                 -> IDLE")
     print("      3) set_state READY   4) inflate_bladder     -> vejiga con agarre")
@@ -1981,13 +2837,13 @@ def print_banner(host, port, simulator, uplink_url):
     print(f"      curl -X POST {base}/command -H \"Content-Type: application/json\" "
           "-d \"{\\\"command\\\":\\\"estop\\\"}\"")
     print("-" * 72)
-    print("⚠️   Ctrl+C para apagar el gemelo digital.")
+    print("⚠️   Ctrl+C para apagar el controlador.")
     print("=" * 72, flush=True)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Backend simulado (gemelo digital) del B.I.C.H.O. - UDD Tunnel Lab."
+        description="Controlador supervisor / gemelo digital del B.I.C.H.O. - UDD Tunnel Lab."
     )
     parser.add_argument("--host", default="", help="Interfaz de escucha (por defecto: todas).")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Puerto HTTP.")
@@ -1999,25 +2855,102 @@ def parse_args(argv=None):
     parser.add_argument(
         "--comms-timeout",
         type=float,
-        default=COMMS_TIMEOUT_S,
-        help="Segundos sin trafico antes del interlock de perdida de red.",
+        default=WATCHDOG_TIMEOUT_S,
+        help="Segundos sin vida de un enlace armado antes del aborto global (def. 10).",
     )
-    parser.add_argument("--uplink-url", default=None, help="URL destino del uplink de telemetria.")
     parser.add_argument(
-        "--uplink-hz", type=float, default=TICK_HZ,
-        help="Frecuencia del uplink (por defecto 10 Hz; minimo TBC: 0.1 Hz).",
+        "--uplink-url", default=None,
+        help="URL del servidor TBC (por defecto: receptor simulado local /tbc_endpoint).",
+    )
+    parser.add_argument(
+        "--uplink-hz", type=float, default=1.0,
+        help="Frecuencia del POST a TBC en Hz (por defecto 1; minimo TBC 0.1).",
     )
     parser.add_argument("--uplink-token", default=None, help="Bearer token para el uplink.")
+    parser.add_argument(
+        "--no-uplink", action="store_true",
+        help="Desactiva el cliente TBC (solo desarrollo: incumple la Regla 7).",
+    )
     parser.add_argument("--seed", type=int, default=None, help="Semilla del ruido simulado.")
     return parser.parse_args(argv)
+
+
+def _report_task_failure(task):
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log_warn(f"La tarea '{task.get_name()}' termino con error: {exc!r}")
+
+
+async def serve(args, start_state):
+    """Compone las capas (inyeccion de dependencias) y las ejecuta."""
+    # --- Adaptador (capa 2) inyectado en el nucleo (capa 3) ---
+    hardware = SimulatedHardwareAdapter(rng=random.Random(args.seed))
+    controller = TBMController(
+        hardware,
+        watchdog_timeout_s=args.comms_timeout,
+        start_state=start_state,
+    )
+    controller.step()                          # primer sample antes de abrir el puerto
+
+    # --- Presentacion (capa 4) ---
+    presenter = TelemetryPresenter()
+    app = create_app(controller, presenter)
+    runner = web.AppRunner(app, access_log=None)
+    await runner.setup()
+    try:
+        site = web.TCPSite(runner, args.host or "0.0.0.0", args.port)
+        await site.start()
+    except OSError as exc:
+        await runner.cleanup()
+        print(f"No se pudo abrir el puerto {args.port}: {exc}")
+        return 1
+
+    uplink_url = None
+    if not args.no_uplink:
+        uplink_url = args.uplink_url or f"http://127.0.0.1:{args.port}/tbc_endpoint"
+    print_banner(args, controller, uplink_url)
+
+    tasks = [asyncio.create_task(controller.run(), name="control-loop")]
+    if uplink_url:
+        client = TBCUplinkClient(
+            controller, presenter, uplink_url, args.uplink_hz, token=args.uplink_token
+        )
+        tasks.append(asyncio.create_task(client.run(), name="tbc-uplink"))
+    for task in tasks:
+        task.add_done_callback(_report_task_failure)
+
+    try:
+        await asyncio.Event().wait()           # hasta Ctrl+C
+    except asyncio.CancelledError:
+        print()
+        log_info("Apagado solicitado por el operador (Ctrl+C).")
+        raise
+    finally:
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await runner.cleanup()
+        snap = controller.snapshot()
+        log_info(
+            f"Resumen final: estado={snap.state.value}, "
+            f"chainage={snap.sensors['chainage_odometry_m']:.3f} m, "
+            f"comandos={snap.commands_received}, "
+            f"tiempo excavando={snap.mining_time_s:.1f} s."
+        )
+        print("🛑 Controlador B.I.C.H.O. detenido.")
+    return 0
 
 
 def main(argv=None):
     configure_console()
     args = parse_args(argv)
 
-    if args.seed is not None:
-        random.seed(args.seed)
+    if aiohttp is None:
+        print("Falta la dependencia 'aiohttp'. Instalela con:\n"
+              "    pip install -r requirements.txt")
+        return 3
 
     start_state = parse_state(args.start_state)
     if start_state is None:
@@ -2028,48 +2961,18 @@ def main(argv=None):
         print(f"El estado inicial no puede ser {start_state.value}: la maquina debe "
               "arrancar en POWER OFF, IDLE o READY.")
         return 2
-    if args.uplink_hz < 0.1:
-        print("El uplink no puede ser mas lento que 0.1 Hz (requisito TBC).")
+    if not args.no_uplink and args.uplink_hz < TBCUplinkClient.MIN_HZ:
+        print(f"El uplink no puede ser mas lento que {TBCUplinkClient.MIN_HZ} Hz "
+              "(requisito TBC).")
+        return 2
+    if args.comms_timeout <= 0.0:
+        print("--comms-timeout debe ser mayor que 0.")
         return 2
 
-    simulator = BichoSimulator(comms_timeout=args.comms_timeout, start_state=start_state)
-    BichoRequestHandler.simulator = simulator
-
-    stop_event = threading.Event()
-    SimulationLoop(simulator, stop_event).start()
-    if args.uplink_url:
-        TelemetryUplink(
-            simulator, args.uplink_url, args.uplink_hz, stop_event, args.uplink_token
-        ).start()
-
     try:
-        server = ThreadingHTTPServer((args.host, args.port), BichoRequestHandler)
-    except OSError as exc:
-        stop_event.set()
-        print(f"No se pudo abrir el puerto {args.port}: {exc}")
-        return 1
-    server.daemon_threads = True
-
-    print_banner(args.host, args.port, simulator, args.uplink_url)
-
-    try:
-        server.serve_forever(poll_interval=0.2)
+        return asyncio.run(serve(args, start_state))
     except KeyboardInterrupt:
-        print()
-        log_info("Apagado solicitado por el operador (Ctrl+C).")
-    finally:
-        stop_event.set()
-        server.shutdown()
-        server.server_close()
-        telemetry = simulator.telemetry()
-        log_info(
-            f"Resumen final: estado={telemetry['extra']['state']}, "
-            f"chainage={telemetry['chainage']} m, "
-            f"comandos={telemetry['extra']['sim']['commands_received']}, "
-            f"tiempo excavando={telemetry['extra']['navigation']['mining_time_s']} s."
-        )
-        print("🛑 Gemelo digital B.I.C.H.O. detenido.")
-    return 0
+        return 0
 
 
 if __name__ == "__main__":
