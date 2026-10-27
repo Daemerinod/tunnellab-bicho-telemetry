@@ -47,6 +47,10 @@ Seguridad (reglamento TBC y PDB del equipo):
   * Watchdog de red de 10 s: un enlace armado sin vida > 10 s => FAULT.
   * E-Stop: actuadores a 0 de inmediato, pero `read_sensors()` se sigue
     llamando a 10 Hz y la telemetria sigue viva.
+  * Parada externa (HMI/PLC): `POST /api/plc/parada` -> `engage_estop()`
+    fuerza E-STOPPED sin validar transiciones y sin rechazarse por un
+    payload invalido (fail-safe); no toca interlocks y salir exige igual
+    'reset_estop' + 'arm'.
   * Cliente TBC (Regla 7): POST de la telemetria a >= 0.1 Hz en segundo plano.
 
 Dependencia externa unica: aiohttp  ->  pip install -r requirements.txt
@@ -925,6 +929,11 @@ RESTART_SEQUENCES = {
     State.FAULT: ("clear_fault", "arm"),
 }
 
+# Nombre de la orden de parada de emergencia externa (HMI / PLC). NO es un
+# comando de `POST /command`: entra por `TBMController.engage_estop()` y no
+# pasa por el despacho de comandos ni por la validacion de transiciones.
+ESTOP_COMMAND = "engage_estop"
+
 STATE_ALIASES = {
     "POWER OFF": State.POWER_OFF,
     "POWEROFF": State.POWER_OFF,
@@ -1046,15 +1055,20 @@ class CommandResult:
 
 @dataclass(frozen=True)
 class EstopResult:
-    """Resultado de una parada de emergencia solicitada por el puente PLC."""
+    """Resultado de una parada de emergencia externa (HMI / PLC).
 
+    El nucleo no conoce HTTP ni el texto que vera el HMI: solo informa que
+    paso. `actuators_zeroed` es una MEDICION (el hardware acepto las
+    consignas a 0 y el STO), no una suposicion.
+    """
+
+    command: str
     source: str
     state: State
     previous_state: State
     estop_engaged: bool
     actuators_zeroed: bool
     already_stopped: bool
-    message: str
     timestamp: int
 
 
@@ -1365,31 +1379,50 @@ class TBMController:
         outcome = CommandOutcome.ACCEPTED if ok else CommandOutcome.REJECTED
         return self._result(ok, outcome, name, message)
 
-    def trigger_plc_estop(self, source="PLC"):
-        """Puente de parada de emergencia del PLC: fuerza E-STOPPED de inmediato."""
-        already = self.state is State.E_STOPPED
-        if already:
-            self.estop_engaged = True
-            self._zero_actuators()
-            log_command(f"POST /api/plc/parada repetida desde {source} (ya en E-STOPPED)")
-        else:
-            log_command(f"POST /api/plc/parada desde {source} [estado={self.state.value}]")
-            self._set_state(
-                State.E_STOPPED,
-                f"parada de emergencia del controlador logico ({source})",
-            )
+    def engage_estop(self, source="UNKNOWN"):
+        """Parada de emergencia externa (HMI / PLC): fuerza E-STOPPED YA.
+
+        A diferencia de `execute()`, NO pasa por el despacho de comandos ni
+        por `_request_state()`/`_preconditions()`: ninguna validacion de la
+        maquina de estados ni ningun interlock puede rechazarla, y funciona
+        desde cualquier estado (incluidos POWER OFF y FAULT). Es idempotente.
+
+        Es SINCRONA y no hace `await`: se completa de forma atomica entre dos
+        ciclos del lazo de `run()`, que ni se detiene ni se bloquea. Tras la
+        parada el lazo sigue llamando a `read_sensors()` a 10 Hz, asi que la
+        telemetria 6DOF y las presiones siguen fluyendo.
+
+        No toca los interlocks (enganchados o activos siguen igual) ni relaja
+        el Safe Restart: salir de E-STOPPED exige 'reset_estop' + 'arm', y una
+        parada repetida invalida cualquier reinicio a medias.
+        """
+        previous = self.state
+        self.commands_received += 1
+        self.last_command = ESTOP_COMMAND
+        log_command(f"'{ESTOP_COMMAND}' source={source} [estado={previous.value}]")
+
+        already = self._engage_estop(f"PARADA DE EMERGENCIA EXTERNA ({source})")
         self._flush_outputs()               # ceros al hardware ANTES de confirmar
+
+        commands = self._last_commands
+        zeroed = bool(
+            commands["safe_torque_off"]
+            and commands["cutterhead_rpm_setpoint"] == 0.0
+            and commands["propulsion_speed_setpoint_mm_min"] == 0.0
+        )
+        if not zeroed:
+            log_warn(
+                f"'{ESTOP_COMMAND}': el hardware no confirmo las consignas a 0/STO; "
+                "el lazo de control reintenta la escritura en cada ciclo."
+            )
         return EstopResult(
+            command=ESTOP_COMMAND,
             source=source,
             state=self.state,
-            previous_state=self.previous_state,
-            estop_engaged=True,
-            actuators_zeroed=True,
+            previous_state=previous,
+            estop_engaged=self.estop_engaged,
+            actuators_zeroed=zeroed,
             already_stopped=already,
-            message=(
-                "Parada de emergencia confirmada. Actuadores en 0; "
-                "presiones, 6DOF y sensores siguen publicandose a 10 Hz."
-            ),
             timestamp=int(self._wall()),
         )
 
@@ -1993,12 +2026,27 @@ class TBMController:
             "independientes ('power_on' + 'arm') para volver a operar."
         )
 
-    def _cmd_estop(self, params):
-        reason = str(params.get("reason", "activacion manual del operador"))
+    def _engage_estop(self, reason):
+        """Nucleo comun de toda parada de emergencia logica (comando 'estop' y
+        `engage_estop()`). Devuelve True si la maquina YA estaba en E-STOPPED.
+
+        Fuerza el estado con `_set_state()` (sin validar transiciones). Si ya
+        estaba parada, re-engancha el hongo logico, pone la intencion a 0 e
+        invalida cualquier Safe Restart a medias: tras una nueva parada, las
+        2 acciones independientes se cuentan desde cero.
+        """
         if self.state is State.E_STOPPED:
             self.estop_engaged = True
+            self._restart_done = set()
+            self._zero_actuators()
+            return True
+        self._set_state(State.E_STOPPED, reason)
+        return False
+
+    def _cmd_estop(self, params):
+        reason = str(params.get("reason", "activacion manual del operador"))
+        if self._engage_estop(f"PARADA DE EMERGENCIA ({reason})"):
             return True, "E-STOP ya estaba activo."
-        self._set_state(State.E_STOPPED, f"PARADA DE EMERGENCIA ({reason})")
         return True, (
             "E-STOP activado: cabezal, propulsion, inflado y direccion detenidos. "
             "Se requieren 2 acciones independientes ('reset_estop' + 'arm') para reiniciar."
@@ -2309,7 +2357,12 @@ class TBMController:
 # CAPA 4 - PRESENTACION / API (telemetria y comunicaciones de competencia)
 # =========================================================================
 # Unica capa que conoce HTTP, JSON y aiohttp. Solo consume la API publica
-# del nucleo (`snapshot()`, `execute()`, `trigger_plc_estop()`...).
+# del nucleo (`snapshot()`, `execute()`, `engage_estop()`...).
+
+# Contrato fijo con el HMI para POST /api/plc/parada.
+ESTOP_HTTP_MESSAGE = "EMERGENCY STOP ENGAGED"
+ESTOP_SOURCE_DEFAULT = "UNKNOWN"
+ESTOP_SOURCE_MAX_CHARS = 64
 
 TBC_ROOT_KEYS = (
     "team", "timestamp", "mining", "chainage",
@@ -2508,18 +2561,13 @@ class TelemetryPresenter:
         }
 
     def estop_response(self, result):
+        """Respuesta de POST /api/plc/parada: exactamente las 4 llaves del
+        contrato con el HMI (el detalle completo queda en /telemetry)."""
         return {
             "ok": True,
-            "confirmed": True,
-            "source": result.source,
+            "message": ESTOP_HTTP_MESSAGE,
             "state": result.state.value,
-            "previous_state": result.previous_state.value,
-            "estop_engaged": result.estop_engaged,
-            "actuators_zeroed": result.actuators_zeroed,
-            "server_running": True,
-            "already_stopped": result.already_stopped,
-            "message": result.message,
-            "timestamp": result.timestamp,
+            "command": result.command,
         }
 
     def health(self, snap):
@@ -2552,7 +2600,11 @@ class TelemetryPresenter:
                 "GET /telemetry": "Telemetria completa en el formato exigido por TBC (sample a 10 Hz).",
                 "POST /command": "Modo manual/ingenieria: {'command': nombre, 'params': {...}}.",
                 "POST /tbc_endpoint": "Receptor simulado de telemetria de The Boring Company.",
-                "POST /api/plc/parada": "Puente PLC: fuerza E-STOPPED y responde 200 de confirmacion.",
+                "POST /api/plc/parada": "Parada de emergencia HMI/PLC (alias /api/plc/estop). "
+                                        "Payload {'source': 'HMI_Operator'}. Fuerza E-STOPPED sin "
+                                        "validar transiciones, aun con payload invalido, y responde "
+                                        "200 {ok, message, state, command}. Salir exige 'reset_estop' "
+                                        "+ 'arm'.",
             },
             "states": [state.value for state in State],
             "allowed_transitions": {
@@ -2634,6 +2686,17 @@ async def read_json_body(request, required=True):
     if not isinstance(body, dict):
         return None, "El JSON debe ser un objeto, por ejemplo {\"command\": \"arm\"}."
     return body, None
+
+
+def sanitize_source(raw, default=ESTOP_SOURCE_DEFAULT, limit=ESTOP_SOURCE_MAX_CHARS):
+    """Texto de origen NO confiable -> una sola linea imprimible y acotada.
+
+    El campo 'source' viene de la red y termina en el log de auditoria:
+    se eliminan saltos de linea/caracteres de control (evita falsificar
+    lineas de log) y se limita la longitud.
+    """
+    printable = "".join(ch if ch.isprintable() else " " for ch in str(raw))
+    return " ".join(printable.split())[:limit] or default
 
 
 if web is not None:
@@ -2731,12 +2794,31 @@ class TelemetryApi:
         return json_response({"status": "success", "message": "Telemetry received by TBC"})
 
     async def plc_estop(self, request):
-        body, error = await read_json_body(request, required=False)
-        if error:
-            return json_response({"ok": False, "error": error}, 400)
-        source = str(body.get("source", body.get("origin", "PLC")))
-        result = self._controller.trigger_plc_estop(source=source)
+        """POST /api/plc/parada  {"source": "HMI_Operator"}.
+
+        FAIL-SAFE: una parada de emergencia nunca se rechaza por culpa del
+        payload. Un cuerpo vacio, mal formado, no-objeto o ilegible solo
+        degrada el campo 'source' a ESTOP_SOURCE_DEFAULT; la maquina se
+        detiene igual y se responde 200.
+        """
+        source = await self._estop_source(request)
+        result = self._controller.engage_estop(source=source)
         return json_response(self._presenter.estop_response(result))
+
+    @staticmethod
+    async def _estop_source(request):
+        """Origen declarado por el cliente, saneado. Nunca lanza excepcion."""
+        try:
+            body, error = await read_json_body(request, required=False)
+        except Exception as exc:                    # cuerpo ilegible o demasiado grande
+            body, error = None, repr(exc)
+        if error:
+            log_warn(
+                f"POST /api/plc/parada con payload invalido ({error}); "
+                "la parada de emergencia se ejecuta igualmente."
+            )
+            return ESTOP_SOURCE_DEFAULT
+        return sanitize_source(body.get("source", body.get("origin", ESTOP_SOURCE_DEFAULT)))
 
 
 def create_app(controller, presenter):
@@ -2826,7 +2908,7 @@ def print_banner(args, controller, uplink_url):
     print(f"📡  Telemetria .............. GET  {base}/telemetry")
     print(f"🎛️   Modo manual/ingenieria .. POST {base}/command")
     print(f"🛑  Receptor TBC simulado ... POST {base}/tbc_endpoint")
-    print(f"🚨  Parada PLC .............. POST {base}/api/plc/parada")
+    print(f"🚨  Parada emergencia HMI ... POST {base}/api/plc/parada  {{\"source\": \"HMI_Operator\"}}")
     print(f"📖  Ayuda de la API ......... GET  {base}/")
     print(f"🐕  Watchdog de red ......... {controller.watchdog_timeout_s:.0f} s sin vida => FAULT")
     if uplink_url:
