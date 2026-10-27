@@ -2403,6 +2403,7 @@ class TelemetryPresenter:
                 "load_limit_percent": CUTTERHEAD_LOAD_MAX_PCT,
                 "current_limit_a": CUTTERHEAD_CURRENT_MAX_A,
                 "inhibited": snap.inhibited[SUB_CUTTERHEAD],
+                "muck_removal_status": "",
             },
             "propulsion": {
                 "enabled": snap.propulsion_enabled,
@@ -2417,6 +2418,8 @@ class TelemetryPresenter:
                 "load_limit_percent": PROPULSION_LOAD_MAX_PCT,
                 "current_limit_a": PROPULSION_CURRENT_MAX_A,
                 "inhibited": snap.inhibited[SUB_PROPULSION],
+                "slip_percent": 0.0,
+                "traction_status": "",
             },
             "bladder": {
                 "pressure_bar": round(s["bladder_pressure_bar"], 3),
@@ -2442,6 +2445,11 @@ class TelemetryPresenter:
                 "stroke_limit_mm": STEER_STROKE_MM,
                 "yaw_rate_deg_s": round(s["yaw_rate_deg_s"], 4),
                 "inhibited": snap.inhibited[SUB_STEERING],
+                "angle_error_deg": 0.0,
+                "actuator_torque_nm": 0.0,
+                "ring_loads_kn": 0.0,
+                "estimated_pitch": 0.0,
+                "estimated_yaw": 0.0,
             },
             "navigation": {
                 "advance_rate_mm_min": round(s["propulsion_speed_mm_min"], 2),
@@ -2458,6 +2466,9 @@ class TelemetryPresenter:
                 "interlocks": snap.interlocks,
                 "safe_restart": snap.safe_restart,
                 "allowed_transitions": snap.allowed_transitions,
+                "machine_energized": False,
+                "power_loss_detected": False,
+                "target_breakthrough_error_m": 0.0,
             },
             "comms": {
                 "ok": comms["ok"],
