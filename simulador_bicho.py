@@ -119,15 +119,15 @@ def log_info(message):
 
 
 def log_warn(message):
-    _log("⚠️ ", "AVISO", message)
+    _log("⚠️ ", "WARN", message)
 
 
 def log_command(message):
-    _log("📥", "COMANDO", message)
+    _log("📥", "COMMAND", message)
 
 
 def log_state(message):
-    _log("🔄", "ESTADO", message)
+    _log("🔄", "STATE", message)
 
 
 def log_interlock(message):
@@ -135,7 +135,7 @@ def log_interlock(message):
 
 
 def log_net(message):
-    _log("📡", "RED", message)
+    _log("📡", "NET", message)
 
 
 def configure_console():
@@ -494,7 +494,7 @@ class SimulatedHardwareAdapter(IHardwareAdapter, IFaultInjectionPort):
     def write_actuators(self, commands):
         missing = [key for key in ACTUATOR_KEYS if key not in commands]
         if missing:
-            raise HardwareError(f"write_actuators() sin las claves {missing}")
+            raise HardwareError(f"write_actuators() missing keys {missing}")
         # Se integra la fisica con la consigna ANTERIOR hasta este instante
         # y recien entonces entra la nueva (como un scan de PLC).
         self._advance_to_now()
@@ -521,58 +521,58 @@ class SimulatedHardwareAdapter(IHardwareAdapter, IFaultInjectionPort):
         canonical = FAULT_ALIASES.get(raw)
         if canonical is None:
             return False, (
-                f"Falla desconocida '{raw}'. Validas: "
+                f"Unknown fault '{raw}'. Valid: "
                 f"{', '.join(self.available_faults())}, generic."
             )
 
         if canonical == "cutterhead_overload":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: sobrecarga en el cabezal de corte.")
-            note = "" if self._ch_rpm > 0 else " (se manifestara al arrancar el cabezal)"
-            return True, f"Sobrecarga inyectada; el interlock disparara solo{note}."
+            log_interlock("Fault injected: cutterhead overload.")
+            note = "" if self._ch_rpm > 0 else " (will manifest when the cutterhead starts)"
+            return True, f"Overload injected; the interlock will trip on its own{note}."
 
         if canonical == "propulsion_overload":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: sobrecarga en el motor de propulsion.")
-            note = "" if self._prop_speed > 0 else " (se manifestara al avanzar)"
-            return True, f"Sobrecarga de propulsion inyectada; el interlock disparara solo{note}."
+            log_interlock("Fault injected: propulsion motor overload.")
+            note = "" if self._prop_speed > 0 else " (will manifest when advancing)"
+            return True, f"Propulsion overload injected; the interlock will trip on its own{note}."
 
         if canonical == "bladder_underpressure":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: fuga en la vejiga de propulsion.")
-            return True, "Fuga inyectada; la presion caera por debajo de P_min."
+            log_interlock("Fault injected: propulsion bladder leak.")
+            return True, "Leak injected; pressure will drop below P_min."
 
         if canonical == "bladder_overpressure":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: valvula de inflado trabada (sobrepresion).")
-            return True, "Bomba trabada inyectada; la presion superara P_max."
+            log_interlock("Fault injected: inflation valve stuck (overpressure).")
+            return True, "Stuck pump injected; pressure will exceed P_max."
 
         if canonical == "comms_loss":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: perdida de comunicacion de red con el hardware.")
+            log_interlock("Fault injected: network communication loss with the hardware.")
             return True, (
-                "Perdida de red simulada; el watchdog ejecutara el aborto global "
-                "si no se recupera dentro de su ventana."
+                "Simulated network loss; the watchdog will perform a global abort "
+                "if it does not recover within its window."
             )
 
         if canonical == "bladder_sensor_battery":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: descarga acelerada de bateria del sensor inalambrico.")
-            return True, "La bateria del sensor caera hasta el umbral critico y disparara FAULT."
+            log_interlock("Fault injected: accelerated battery drain on the wireless sensor.")
+            return True, "Sensor battery will drain to the critical threshold and trigger FAULT."
 
         if canonical == "bladder_sensor_signal":
             self._faults.add(canonical)
-            log_interlock("Falla inyectada: perdida de enlace del sensor inalambrico de vejiga.")
-            return True, "Enlace del sensor perdido; el interlock llevara la maquina a FAULT."
+            log_interlock("Fault injected: wireless bladder sensor link loss.")
+            return True, "Sensor link lost; the interlock will drive the machine to FAULT."
 
         if canonical == "bladder_sensor":
             self._faults.add("bladder_sensor_signal")
-            log_interlock("Falla inyectada: sensor inalambrico de vejiga (enlace + bateria).")
-            return True, "Sensor inalambrico fuera de servicio; la maquina pasara a FAULT."
+            log_interlock("Fault injected: wireless bladder sensor (link + battery).")
+            return True, "Wireless sensor out of service; the machine will go to FAULT."
 
         # hardware_estop
         self.set_hardware_estop(True)
-        return True, "Hongo de emergencia FISICO presionado (simulado)."
+        return True, "PHYSICAL E-stop button pressed (simulated)."
 
     def clear_injected_faults(self):
         # El hongo fisico NO se libera aqui: solo se libera con set_hardware_estop(False).
@@ -604,9 +604,9 @@ class SimulatedHardwareAdapter(IHardwareAdapter, IFaultInjectionPort):
             if lost:
                 self._bs_signal_ms = BLADDER_SENSOR_SIGNAL_TIMEOUT_MS
         return True, (
-            f"Sensor inalambrico: bateria {self._bs_battery:.1f} %, "
-            f"señal {self._bs_signal_ms:.1f} ms, "
-            f"enlace={'ok' if self._bs_link_ok else 'perdido'}."
+            f"Wireless sensor: battery {self._bs_battery:.1f} %, "
+            f"signal {self._bs_signal_ms:.1f} ms, "
+            f"link={'ok' if self._bs_link_ok else 'lost'}."
         )
 
     def set_hardware_estop(self, pressed):
@@ -1135,7 +1135,7 @@ class TBMController:
         wall_clock=time.time,
     ):
         if not isinstance(hardware, IHardwareAdapter):
-            raise TypeError("El hardware debe implementar IHardwareAdapter.")
+            raise TypeError("The hardware must implement IHardwareAdapter.")
         self._hw = hardware
         self._clock = clock
         self._wall = wall_clock
@@ -1166,37 +1166,37 @@ class TBMController:
         self.interlocks = {
             "cutterhead_overload": Interlock(
                 "cutterhead_overload",
-                "Sobrecorriente o sobrecarga en el cabezal de corte",
+                "Overcurrent or overload on the cutterhead",
                 {SUB_CUTTERHEAD, SUB_PROPULSION},
                 forces_fault=True,
             ),
             "propulsion_overload": Interlock(
                 "propulsion_overload",
-                "Sobrecorriente o sobrecarga en el motor de propulsion",
+                "Overcurrent or overload on the propulsion motor",
                 {SUB_PROPULSION},
                 forces_fault=False,
             ),
             "bladder_underpressure": Interlock(
                 "bladder_underpressure",
-                "Presion de la vejiga de propulsion por debajo de P_min",
+                "Propulsion bladder pressure below P_min",
                 {SUB_PROPULSION},
                 forces_fault=False,
             ),
             "bladder_overpressure": Interlock(
                 "bladder_overpressure",
-                "Sobrepresion en la vejiga de propulsion (P > P_max)",
+                "Propulsion bladder overpressure (P > P_max)",
                 {SUB_PROPULSION, SUB_INFLATION},
                 forces_fault=True,
             ),
             "comms_loss": Interlock(
                 "comms_loss",
-                "Perdida de comunicacion de red: aborto global",
+                "Network communication loss: global abort",
                 {SUB_CUTTERHEAD, SUB_PROPULSION, SUB_INFLATION, SUB_STEERING},
                 forces_fault=True,
             ),
             "bladder_sensor": Interlock(
                 "bladder_sensor",
-                "Sensor inalambrico de vejiga: enlace perdido o bateria critica",
+                "Wireless bladder sensor: link lost or critical battery",
                 {SUB_CUTTERHEAD, SUB_PROPULSION, SUB_INFLATION, SUB_STEERING},
                 forces_fault=True,
             ),
@@ -1258,8 +1258,8 @@ class TBMController:
             self.previous_state = State.POWER_OFF
             self._on_enter_state(start_state, State.POWER_OFF)
             log_warn(
-                f"Estado inicial forzado a {start_state.value} por linea de comandos "
-                "(modo desarrollo, se omite la secuencia de encendido)."
+                f"Initial state forced to {start_state.value} via command line "
+                "(development mode, power-on sequence skipped)."
             )
 
     # -------------------------------------------------------------------
@@ -1276,8 +1276,8 @@ class TBMController:
     async def run(self, period_s=TICK_PERIOD_S):
         """Lazo de control no bloqueante (tarea asyncio) a 1/period_s Hz."""
         log_info(
-            f"Lazo de control del nucleo activo a {1.0 / period_s:.0f} Hz "
-            f"(adaptador: {self.adapter_name})."
+            f"Core control loop active at {1.0 / period_s:.0f} Hz "
+            f"(adapter: {self.adapter_name})."
         )
         next_tick = self._clock()
         failures = 0
@@ -1288,7 +1288,7 @@ class TBMController:
             except Exception as exc:               # el lazo nunca debe morir
                 failures += 1
                 if failures == 1 or failures % 50 == 0:
-                    log_warn(f"Error en el lazo de control: {exc!r}")
+                    log_warn(f"Control loop error: {exc!r}")
                 self._fail_safe()
             next_tick += period_s
             delay = next_tick - self._clock()
@@ -1327,7 +1327,7 @@ class TBMController:
         """El cliente TBC informa el resultado de cada POST."""
         if ok:
             if self.uplink_failures > 0:
-                log_net("Enlace de telemetria hacia TBC restablecido.")
+                log_net("Telemetry link to TBC restored.")
             self.uplink_ok = True
             self.uplink_failures = 0
             self.uplink_sent += 1
@@ -1335,12 +1335,12 @@ class TBMController:
         self.uplink_ok = False
         self.uplink_failures += 1
         if self.uplink_failures == 1:
-            log_net(f"Envio de telemetria a TBC fallido ({detail}).")
+            log_net(f"Telemetry upload to TBC failed ({detail}).")
         if self.uplink_failures == UPLINK_MAX_FAILURES:
             log_net(
-                f"{self.uplink_failures} envios de telemetria fallidos consecutivos "
-                f"({detail}): enlace TBC caido; el watchdog de "
-                f"{self.watchdog_timeout_s:.0f} s queda en cuenta regresiva."
+                f"{self.uplink_failures} consecutive telemetry uploads failed "
+                f"({detail}): TBC link down; the "
+                f"{self.watchdog_timeout_s:.0f} s watchdog is counting down."
             )
 
     def execute(self, command, params):
@@ -1351,30 +1351,30 @@ class TBMController:
 
         handler = self._commands.get(name)
         if handler is None:
-            log_warn(f"Comando desconocido: '{name}'")
+            log_warn(f"Unknown command: '{name}'")
             return self._result(
                 False, CommandOutcome.INVALID, name,
-                f"Comando desconocido '{name}'. Comandos validos: "
+                f"Unknown command '{name}'. Valid commands: "
                 f"{', '.join(self.command_names())}.",
             )
 
         self.commands_received += 1
         self.last_command = name
         log_command(f"'{name}' params={json.dumps(params, ensure_ascii=False)} "
-                    f"[estado={self.state.value}]")
+                    f"[state={self.state.value}]")
         try:
             ok, message = handler(params)
         except (TypeError, ValueError) as exc:
-            log_warn(f"'{name}' con parametros invalidos: {exc}")
+            log_warn(f"'{name}' with invalid parameters: {exc}")
             self._flush_outputs()
             return self._result(
-                False, CommandOutcome.INVALID, name, f"Parametros invalidos: {exc}"
+                False, CommandOutcome.INVALID, name, f"Invalid parameters: {exc}"
             )
 
         if ok:
-            log_info(f"'{name}' ACEPTADO -> {message}")
+            log_info(f"'{name}' ACCEPTED -> {message}")
         else:
-            log_warn(f"'{name}' RECHAZADO -> {message}")
+            log_warn(f"'{name}' REJECTED -> {message}")
         self._flush_outputs()
         outcome = CommandOutcome.ACCEPTED if ok else CommandOutcome.REJECTED
         return self._result(ok, outcome, name, message)
@@ -1399,9 +1399,9 @@ class TBMController:
         previous = self.state
         self.commands_received += 1
         self.last_command = ESTOP_COMMAND
-        log_command(f"'{ESTOP_COMMAND}' source={source} [estado={previous.value}]")
+        log_command(f"'{ESTOP_COMMAND}' source={source} [state={previous.value}]")
 
-        already = self._engage_estop(f"PARADA DE EMERGENCIA EXTERNA ({source})")
+        already = self._engage_estop(f"EXTERNAL EMERGENCY STOP ({source})")
         self._flush_outputs()               # ceros al hardware ANTES de confirmar
 
         commands = self._last_commands
@@ -1412,8 +1412,8 @@ class TBMController:
         )
         if not zeroed:
             log_warn(
-                f"'{ESTOP_COMMAND}': el hardware no confirmo las consignas a 0/STO; "
-                "el lazo de control reintenta la escritura en cada ciclo."
+                f"'{ESTOP_COMMAND}': hardware did not confirm setpoints at 0/STO; "
+                "the control loop retries the write on every cycle."
             )
         return EstopResult(
             command=ESTOP_COMMAND,
@@ -1454,7 +1454,7 @@ class TBMController:
             raw = self._hw.read_sensors()
             missing = [key for key in SENSOR_KEYS if key not in raw]
             if missing:
-                raise HardwareError(f"read_sensors() sin las claves {missing}")
+                raise HardwareError(f"read_sensors() missing keys {missing}")
             self._sensors = dict(raw)
             if self._start_chainage is None:
                 self._start_chainage = self._sensors["chainage_odometry_m"]
@@ -1494,7 +1494,7 @@ class TBMController:
     def _report_io_error(self, operation, exc):
         if not self._io_error_logged:
             self._io_error_logged = True
-            log_interlock(f"Error de E/S con el hardware en {operation}(): {exc!r}")
+            log_interlock(f"Hardware I/O error in {operation}(): {exc!r}")
 
     def _sensed(self, key, default=0.0):
         return self._sensors.get(key, default)
@@ -1506,12 +1506,12 @@ class TBMController:
     def _supervise(self, now, dt):
         if not self._io_ok and self._io_prev_ok:
             log_interlock(
-                "Fallo de E/S con el hardware: consignas a estado seguro (STO) "
-                "y actuacion detenida."
+                "Hardware I/O failure: setpoints set to safe state (STO) "
+                "and actuation stopped."
             )
             self._stop_all_actuation()
             if self.state is State.MINING:
-                self._set_state(State.READY, "excavacion abortada por fallo de E/S del hardware")
+                self._set_state(State.READY, "mining aborted due to hardware I/O failure")
         self._io_prev_ok = self._io_ok
 
         self._handle_hardware_estop()
@@ -1532,14 +1532,14 @@ class TBMController:
     def _handle_hardware_estop(self):
         pressed = self._hw_estop_now
         if pressed and not self._hw_estop_prev:
-            log_command("PARADA DE EMERGENCIA FISICA detectada en el hardware.")
+            log_command("PHYSICAL EMERGENCY STOP detected on the hardware.")
             self._restart_done = set()          # el reinicio en curso se invalida
         self._hw_estop_prev = pressed
         if not pressed:
             return
         self.estop_engaged = True
         if self.state is not State.E_STOPPED:
-            self._set_state(State.E_STOPPED, "hongo de emergencia fisico (hardware)")
+            self._set_state(State.E_STOPPED, "physical E-stop button (hardware)")
 
     def _armed_links(self):
         links = []
@@ -1565,8 +1565,8 @@ class TBMController:
         if self._overload_timer >= OVERLOAD_DEBOUNCE_S:
             self._trip(
                 lock,
-                f"carga {s['cutterhead_load_pct']:.0f} % / {s['cutterhead_current_a']:.1f} A "
-                f"(limites {CUTTERHEAD_LOAD_MAX_PCT:.0f} % / {CUTTERHEAD_CURRENT_MAX_A:.1f} A)",
+                f"load {s['cutterhead_load_pct']:.0f} % / {s['cutterhead_current_a']:.1f} A "
+                f"(limits {CUTTERHEAD_LOAD_MAX_PCT:.0f} % / {CUTTERHEAD_CURRENT_MAX_A:.1f} A)",
             )
 
         # --- 2. Sobrecorriente / sobrecarga del motor de propulsion ---
@@ -1583,8 +1583,8 @@ class TBMController:
         if self._prop_overload_timer >= OVERLOAD_DEBOUNCE_S:
             self._trip(
                 lock,
-                f"carga {s['propulsion_load_pct']:.0f} % / {s['propulsion_current_a']:.1f} A "
-                f"(limites {PROPULSION_LOAD_MAX_PCT:.0f} % / {PROPULSION_CURRENT_MAX_A:.1f} A)",
+                f"load {s['propulsion_load_pct']:.0f} % / {s['propulsion_current_a']:.1f} A "
+                f"(limits {PROPULSION_LOAD_MAX_PCT:.0f} % / {PROPULSION_CURRENT_MAX_A:.1f} A)",
             )
 
         # --- 3. Perdida de presion en la vejiga de propulsion ---
@@ -1599,7 +1599,7 @@ class TBMController:
         if lock.active:
             self._trip(
                 lock,
-                f"P_vejiga {pressure:.2f} bar < P_min {BLADDER_P_MIN:.2f} bar",
+                f"P_bladder {pressure:.2f} bar < P_min {BLADDER_P_MIN:.2f} bar",
             )
 
         # --- 4. Sobrepresion en la vejiga: detiene inflado y dispara el alivio ---
@@ -1608,14 +1608,14 @@ class TBMController:
         if lock.active:
             if not self.relief_valve_open:
                 self.relief_valve_open = True
-                log_interlock("Valvula de alivio de presion ABIERTA.")
+                log_interlock("Pressure relief valve OPENED.")
             self._trip(
                 lock,
-                f"P_vejiga {pressure:.2f} bar > P_max {BLADDER_P_MAX:.2f} bar",
+                f"P_bladder {pressure:.2f} bar > P_max {BLADDER_P_MAX:.2f} bar",
             )
         elif self.relief_valve_open and pressure <= BLADDER_P_MAX - BLADDER_RELIEF_HYST:
             self.relief_valve_open = False
-            log_interlock(f"Valvula de alivio CERRADA (P_vejiga {pressure:.2f} bar).")
+            log_interlock(f"Relief valve CLOSED (P_bladder {pressure:.2f} bar).")
 
         # --- 5. Watchdog de red: aborto global si un enlace armado calla > 10 s ---
         lock = self.interlocks["comms_loss"]
@@ -1626,7 +1626,7 @@ class TBMController:
         lock.active = bool(expired)
         if expired:
             detail = "; ".join(
-                f"enlace '{link}' sin señales de vida durante {silence:.1f} s"
+                f"link '{link}' with no sign of life for {silence:.1f} s"
                 for link, silence in expired
             ) + f" (watchdog {self.watchdog_timeout_s:.1f} s)"
             self._trip(lock, detail)
@@ -1642,15 +1642,15 @@ class TBMController:
         lock.active = battery_critical or signal_lost
         if lock.active:
             if battery_critical and signal_lost:
-                detail = f"bateria {battery:.1f} % y señal {signal_ms:.0f} ms"
+                detail = f"battery {battery:.1f} % and signal {signal_ms:.0f} ms"
             elif battery_critical:
                 detail = (
-                    f"bateria {battery:.1f} % <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} %"
+                    f"battery {battery:.1f} % <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} %"
                 )
             else:
                 detail = (
-                    f"señal {signal_ms:.0f} ms >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms "
-                    "(enlace perdido)"
+                    f"signal {signal_ms:.0f} ms >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms "
+                    "(link lost)"
                 )
             self._trip(lock, detail)
 
@@ -1659,9 +1659,9 @@ class TBMController:
         if not lock.trip(self._wall()):
             return
 
-        log_interlock(f"DISPARADO '{lock.key}': {lock.description}.")
-        log_interlock(f"   Causa: {detail}")
-        log_interlock(f"   Inhabilita: {', '.join(sorted(lock.inhibits))}")
+        log_interlock(f"TRIPPED '{lock.key}': {lock.description}.")
+        log_interlock(f"   Cause: {detail}")
+        log_interlock(f"   Inhibits: {', '.join(sorted(lock.inhibits))}")
 
         for subsystem in lock.inhibits:
             self._stop_subsystem(subsystem)
@@ -1676,7 +1676,7 @@ class TBMController:
                 self._stop_all_actuation()
         elif self.state is State.MINING and SUB_PROPULSION in lock.inhibits:
             # Degradacion segura: sin propulsion no se puede excavar.
-            self._set_state(State.READY, f"excavacion abortada por interlock '{lock.key}'")
+            self._set_state(State.READY, f"mining aborted by interlock '{lock.key}'")
 
     def _condition_present(self, key):
         """Reevalua en el instante si la causa fisica de un interlock persiste."""
@@ -1962,68 +1962,68 @@ class TBMController:
         sequence = RESTART_SEQUENCES.get(self.state)
         if sequence is None or step not in sequence:
             return False, (
-                f"El paso '{step}' no corresponde al estado {self.state.value}."
+                f"Step '{step}' does not apply to state {self.state.value}."
             )
 
         index = sequence.index(step)
         missing = [s for s in sequence[:index] if s not in self._restart_done]
         if missing:
             return False, (
-                "Secuencia de reinicio seguro incompleta: primero debe ejecutar "
-                f"'{missing[0]}' antes de '{step}'."
+                "Incomplete Safe Restart sequence: you must first run "
+                f"'{missing[0]}' before '{step}'."
             )
         if step in self._restart_done:
             pending = [s for s in sequence if s not in self._restart_done]
             return True, (
-                f"El paso '{step}' ya estaba registrado. Falta(n): {', '.join(pending)}."
+                f"Step '{step}' was already registered. Remaining: {', '.join(pending)}."
             )
 
         is_last = index == len(sequence) - 1
         if is_last:
             blocked = self._restart_blockers()
             if blocked:
-                return False, "Rearme bloqueado: " + "; ".join(blocked)
+                return False, "Re-arm BLOCKED: " + "; ".join(blocked)
 
         self._restart_done.add(step)
         done, total = len(self._restart_done), len(sequence)
-        log_info(f"Reinicio seguro {done}/{total}: {note}")
+        log_info(f"Safe Restart {done}/{total}: {note}")
 
         if done < total:
             pending = [s for s in sequence if s not in self._restart_done]
             return True, (
-                f"Accion {done}/{total} registrada ({note}). "
-                f"Falta(n) {len(pending)} accion(es) independiente(s): {', '.join(pending)}."
+                f"Action {done}/{total} registered ({note}). "
+                f"{len(pending)} independent action(s) remaining: {', '.join(pending)}."
             )
 
         self._set_state(
             State.IDLE,
-            f"reinicio seguro completado con {total} acciones independientes",
+            f"Safe Restart completed with {total} independent actions",
         )
-        return True, "Reinicio seguro completo. Maquina en IDLE."
+        return True, "Safe Restart complete. Machine in IDLE."
 
     def _restart_blockers(self):
         blockers = []
         if self._hardware_estop_pressed():
-            blockers.append("el hongo de emergencia FISICO sigue presionado")
+            blockers.append("the PHYSICAL E-stop button is still pressed")
         elif self.estop_engaged:
-            blockers.append("el hongo de emergencia sigue engachado (use 'reset_estop')")
+            blockers.append("the E-stop remains latched (use 'reset_estop')")
         latched = self._latched_keys()
         if latched:
-            blockers.append(f"interlocks aun enganchados: {', '.join(latched)}")
+            blockers.append(f"interlocks still latched: {', '.join(latched)}")
         return blockers
 
     def _cmd_power_on(self, params):
         if self.state is not State.POWER_OFF:
-            return False, f"La maquina ya esta energizada (estado {self.state.value})."
-        return self._mark_restart_step("power_on", "energia principal aplicada")
+            return False, f"The machine is already powered on (state {self.state.value})."
+        return self._mark_restart_step("power_on", "main power applied")
 
     def _cmd_power_off(self, params):
         if self.state is State.POWER_OFF:
-            return True, "La maquina ya estaba sin energia."
-        self._set_state(State.POWER_OFF, "corte de energia solicitado por el operador")
+            return True, "The machine was already powered off."
+        self._set_state(State.POWER_OFF, "power cut requested by the operator")
         return True, (
-            "Energia cortada y actuacion detenida. Se requieren 2 acciones "
-            "independientes ('power_on' + 'arm') para volver a operar."
+            "Power cut and actuation stopped. 2 independent actions "
+            "('power_on' + 'arm') are required to resume operation."
         )
 
     def _engage_estop(self, reason):
@@ -2044,35 +2044,35 @@ class TBMController:
         return False
 
     def _cmd_estop(self, params):
-        reason = str(params.get("reason", "activacion manual del operador"))
-        if self._engage_estop(f"PARADA DE EMERGENCIA ({reason})"):
-            return True, "E-STOP ya estaba activo."
+        reason = str(params.get("reason", "manual operator activation"))
+        if self._engage_estop(f"EMERGENCY STOP ({reason})"):
+            return True, "E-STOP was already active."
         return True, (
-            "E-STOP activado: cabezal, propulsion, inflado y direccion detenidos. "
-            "Se requieren 2 acciones independientes ('reset_estop' + 'arm') para reiniciar."
+            "E-STOP engaged: cutterhead, propulsion, inflation and steering stopped. "
+            "2 independent actions ('reset_estop' + 'arm') are required to restart."
         )
 
     def _cmd_reset_estop(self, params):
         if self._hardware_estop_pressed():
             return False, (
-                "El hongo de emergencia FISICO sigue presionado: liberelo antes "
-                "de ejecutar 'reset_estop'."
+                "The PHYSICAL E-stop button is still pressed: release it before "
+                "running 'reset_estop'."
             )
         if self.state is not State.E_STOPPED:
             if self.estop_engaged:
                 self.estop_engaged = False
-                return True, "Hongo de emergencia liberado."
-            return False, f"No hay E-STOP activo (estado {self.state.value})."
+                return True, "E-stop button released."
+            return False, f"No active E-STOP (state {self.state.value})."
         self.estop_engaged = False
-        return self._mark_restart_step("reset_estop", "hongo de emergencia liberado")
+        return self._mark_restart_step("reset_estop", "E-stop button released")
 
     def _cmd_arm(self, params):
         if self.state not in RESTART_SEQUENCES:
             return False, (
-                f"'arm' solo aplica en {', '.join(s.value for s in RESTART_SEQUENCES)}. "
-                f"Estado actual: {self.state.value}."
+                f"'arm' only applies in {', '.join(s.value for s in RESTART_SEQUENCES)}. "
+                f"Current state: {self.state.value}."
             )
-        return self._mark_restart_step("arm", "rearme confirmado por el operador")
+        return self._mark_restart_step("arm", "re-arm confirmed by the operator")
 
     def _cmd_clear_fault(self, params):
         # Retira primero las fallas inyectadas por el modo ingenieria.
@@ -2092,21 +2092,21 @@ class TBMController:
             else:
                 lock.clear()
                 cleared.append(key)
-                log_interlock(f"Interlock '{key}' reseteado por el operador.")
+                log_interlock(f"Interlock '{key}' reset by the operator.")
 
         if blocking:
             return False, (
-                "No se puede resetear: la condicion fisica persiste en "
-                f"{', '.join(blocking)}. Corrija la causa y reintente."
+                "Cannot reset: the physical condition persists in "
+                f"{', '.join(blocking)}. Fix the cause and retry."
             )
 
         if self.state is not State.FAULT:
             return True, (
-                f"Interlocks reseteados ({', '.join(cleared) if cleared else 'ninguno pendiente'})."
+                f"Interlocks reset ({', '.join(cleared) if cleared else 'none pending'})."
             )
         return self._mark_restart_step(
             "clear_fault",
-            f"interlocks reseteados ({', '.join(cleared) if cleared else 'ninguno'})",
+            f"interlocks reset ({', '.join(cleared) if cleared else 'none'})",
         )
 
     # --- Cambio de estado general --------------------------------------
@@ -2114,69 +2114,69 @@ class TBMController:
     def _cmd_set_state(self, params):
         raw = params.get("state", params.get("target"))
         if raw is None:
-            return False, "Falta el parametro 'state' (IDLE, READY, MINING, ...)."
+            return False, "Missing parameter 'state' (IDLE, READY, MINING, ...)."
         target = parse_state(raw)
         if target is None:
             return False, (
-                f"Estado desconocido '{raw}'. Validos: "
+                f"Unknown state '{raw}'. Valid: "
                 f"{', '.join(s.value for s in State)}."
             )
         return self._request_state(target, params)
 
     def _request_state(self, target, params):
         if target is self.state:
-            return True, f"La maquina ya se encuentra en {target.value}."
+            return True, f"The machine is already in {target.value}."
 
         if target is State.POWER_OFF:
             return self._cmd_power_off(params)
         if target is State.E_STOPPED:
-            return self._cmd_estop({"reason": "solicitado por comando set_state"})
+            return self._cmd_estop({"reason": "requested via set_state command"})
         if target is State.FAULT:
             return self._cmd_simulate_fault({"fault": "generic"})
 
         if target not in ALLOWED_TRANSITIONS[self.state]:
             allowed = ", ".join(sorted(s.value for s in ALLOWED_TRANSITIONS[self.state]))
             return False, (
-                f"Transicion insegura BLOQUEADA: {self.state.value} -> {target.value}. "
-                f"Transiciones permitidas desde {self.state.value}: {allowed}."
+                f"Unsafe transition BLOCKED: {self.state.value} -> {target.value}. "
+                f"Allowed transitions from {self.state.value}: {allowed}."
             )
 
         if self.state in RESTART_SEQUENCES:
             sequence = " + ".join(RESTART_SEQUENCES[self.state])
             return False, (
-                f"Salir de {self.state.value} exige la secuencia de reinicio seguro "
-                f"de 2 acciones independientes: {sequence}."
+                f"Leaving {self.state.value} requires the Safe Restart sequence "
+                f"of 2 independent actions: {sequence}."
             )
 
         ok, why = self._preconditions(target)
         if not ok:
             return False, why
 
-        self._set_state(target, "solicitado por el operador")
-        return True, f"Estado {target.value} activo."
+        self._set_state(target, "requested by the operator")
+        return True, f"State {target.value} active."
 
     def _preconditions(self, target):
         latched = self._latched_keys()
         if target in (State.READY, State.MINING):
             if self.estop_engaged or self._hw_estop_now:
-                return False, "El hongo de emergencia sigue engachado."
+                return False, "The E-stop remains latched."
             if latched:
                 return False, (
-                    f"Interlocks enganchados: {', '.join(latched)}. "
-                    "Ejecute 'clear_fault' antes de habilitar la maquina."
+                    f"Latched interlocks: {', '.join(latched)}. "
+                    "Run 'clear_fault' before enabling the machine."
                 )
         if target is State.MINING:
             if not self.cutterhead_running or self.cutterhead_rpm_target < CUTTERHEAD_RPM_MIN_MINING:
                 return False, (
-                    "Para excavar el cabezal de corte debe estar en marcha con al menos "
-                    f"{CUTTERHEAD_RPM_MIN_MINING:.1f} rpm de consigna "
-                    "(ejecute 'start_cutterhead')."
+                    "To mine, the cutterhead must be running with at least "
+                    f"{CUTTERHEAD_RPM_MIN_MINING:.1f} rpm setpoint "
+                    "(run 'start_cutterhead')."
                 )
             pressure = self._sensed("bladder_pressure_bar")
             if pressure < BLADDER_P_MIN:
                 return False, (
-                    f"Vejiga sin agarre: P {pressure:.2f} bar < "
-                    f"P_min {BLADDER_P_MIN:.2f} bar (ejecute 'inflate_bladder' y espere)."
+                    f"Bladder not gripping: P {pressure:.2f} bar < "
+                    f"P_min {BLADDER_P_MIN:.2f} bar (run 'inflate_bladder' and wait)."
                 )
         return True, ""
 
@@ -2185,58 +2185,58 @@ class TBMController:
     def _cmd_start_cutterhead(self, params):
         if self.state not in (State.READY, State.MINING):
             return False, (
-                "El cabezal de corte solo puede arrancar en READY o MINING "
-                f"(estado actual {self.state.value})."
+                "The cutterhead can only start in READY or MINING "
+                f"(current state {self.state.value})."
             )
         if self._inhibited(SUB_CUTTERHEAD):
-            return False, "Cabezal inhabilitado por un interlock enganchado."
+            return False, "Cutterhead inhibited by a latched interlock."
         rpm = float(params.get("rpm", self.cutterhead_rpm_target or CUTTERHEAD_RPM_DEFAULT))
         self.cutterhead_rpm_target = clamp(rpm, 0.5, CUTTERHEAD_RPM_MAX)
         self.cutterhead_running = True
-        return True, f"Cabezal en marcha, consigna {self.cutterhead_rpm_target:.2f} rpm."
+        return True, f"Cutterhead running, setpoint {self.cutterhead_rpm_target:.2f} rpm."
 
     def _cmd_stop_cutterhead(self, params):
         was_mining = self.state is State.MINING
         self.cutterhead_running = False
         self.cutterhead_rpm_target = 0.0
         if was_mining:
-            self._set_state(State.READY, "cabezal de corte detenido por el operador")
-            return True, "Cabezal detenido; excavacion suspendida y maquina en READY."
-        return True, "Cabezal de corte detenido."
+            self._set_state(State.READY, "cutterhead stopped by the operator")
+            return True, "Cutterhead stopped; mining suspended and machine in READY."
+        return True, "Cutterhead stopped."
 
     def _cmd_set_cutterhead_rpm(self, params):
         if "rpm" not in params:
-            return False, "Falta el parametro 'rpm'."
+            return False, "Missing parameter 'rpm'."
         if self.state not in (State.READY, State.MINING):
             return False, (
-                f"Solo se ajustan rpm en READY o MINING (estado actual {self.state.value})."
+                f"RPM can only be adjusted in READY or MINING (current state {self.state.value})."
             )
         rpm = clamp(float(params["rpm"]), 0.0, CUTTERHEAD_RPM_MAX)
         if rpm > 0.0 and self._inhibited(SUB_CUTTERHEAD):
-            return False, "Cabezal inhabilitado por un interlock enganchado."
+            return False, "Cutterhead inhibited by a latched interlock."
         self.cutterhead_rpm_target = rpm
         if rpm <= 0.0:
             return self._cmd_stop_cutterhead({})
         self.cutterhead_running = True
         if self.state is State.MINING and rpm < CUTTERHEAD_RPM_MIN_MINING:
-            self._set_state(State.READY, "rpm del cabezal por debajo del minimo para excavar")
+            self._set_state(State.READY, "cutterhead rpm below the minimum for mining")
             return True, (
-                f"Consigna {rpm:.2f} rpm por debajo del minimo para excavar; maquina en READY."
+                f"Setpoint {rpm:.2f} rpm below the minimum for mining; machine in READY."
             )
-        return True, f"Consigna del cabezal en {rpm:.2f} rpm."
+        return True, f"Cutterhead setpoint at {rpm:.2f} rpm."
 
     # --- Direccion A/B --------------------------------------------------
 
     def _cmd_steer(self, params):
         motor = str(params.get("motor", "A")).strip().upper()
         if motor not in ("A", "B", "BOTH"):
-            return False, "El parametro 'motor' debe ser 'A', 'B' o 'both'."
+            return False, "Parameter 'motor' must be 'A', 'B' or 'both'."
         if self.state in (State.POWER_OFF, State.E_STOPPED, State.FAULT):
             return False, (
-                f"Los motores de direccion no operan en {self.state.value}."
+                f"Steering motors do not operate in {self.state.value}."
             )
         if self._inhibited(SUB_STEERING):
-            return False, "Direccion inhabilitada por un interlock enganchado."
+            return False, "Steering inhibited by a latched interlock."
 
         if "position_mm" in params:
             requested = float(params["position_mm"])
@@ -2245,7 +2245,7 @@ class TBMController:
             requested = float(params["delta_mm"])
             absolute = False
         else:
-            return False, "Indique 'position_mm' (absoluto) o 'delta_mm' (relativo)."
+            return False, "Provide 'position_mm' (absolute) or 'delta_mm' (relative)."
 
         targets = ("a", "b") if motor == "BOTH" else (motor.lower(),)
         applied = []
@@ -2255,44 +2255,44 @@ class TBMController:
             setattr(self, f"steer_{axis}_target_mm", value)
             applied.append(f"{axis.upper()}={value:+.2f} mm")
         return True, (
-            "Consigna de direccion actualizada: " + ", ".join(applied)
-            + f" (recorrido +/-{STEER_STROKE_MM:.0f} mm)."
+            "Steering setpoint updated: " + ", ".join(applied)
+            + f" (stroke +/-{STEER_STROKE_MM:.0f} mm)."
         )
 
     def _cmd_center_steering(self, params):
         if self._inhibited(SUB_STEERING):
-            return False, "Direccion inhabilitada por un interlock enganchado."
+            return False, "Steering inhibited by a latched interlock."
         self.steer_a_target_mm = 0.0
         self.steer_b_target_mm = 0.0
-        return True, "Motores de direccion A y B centrados."
+        return True, "Steering motors A and B centered."
 
     # --- Propulsion y vejiga -------------------------------------------
 
     def _cmd_set_propulsion_speed(self, params):
         key = "speed_mm_min" if "speed_mm_min" in params else "speed"
         if key not in params:
-            return False, "Falta el parametro 'speed_mm_min'."
+            return False, "Missing parameter 'speed_mm_min'."
         if self.state not in (State.READY, State.MINING):
             return False, (
-                f"La propulsion solo se ajusta en READY o MINING (estado {self.state.value})."
+                f"Propulsion can only be adjusted in READY or MINING (state {self.state.value})."
             )
         if self._inhibited(SUB_PROPULSION):
-            return False, "Propulsion inhabilitada por un interlock enganchado."
+            return False, "Propulsion inhibited by a latched interlock."
         speed = clamp(float(params[key]), 0.0, PROPULSION_SPEED_MAX)
         self.propulsion_speed_target = speed
-        return True, f"Consigna de propulsion en {speed:.2f} mm/min."
+        return True, f"Propulsion setpoint at {speed:.2f} mm/min."
 
     def _cmd_inflate_bladder(self, params):
         if self.state in (State.POWER_OFF, State.E_STOPPED, State.FAULT):
-            return False, f"No se puede inflar la vejiga en {self.state.value}."
+            return False, f"Cannot inflate the bladder in {self.state.value}."
         if self._inhibited(SUB_INFLATION):
-            return False, "Inflado inhabilitado por un interlock enganchado."
+            return False, "Inflation inhibited by a latched interlock."
         target = float(params.get("target_bar", BLADDER_P_TARGET_DEFAULT))
         self.bladder_target = clamp(target, 0.0, BLADDER_P_TARGET_MAX)
         self.bladder_inflating = True
         return True, (
-            f"Inflado activo, consigna {self.bladder_target:.2f} bar "
-            f"(rango seguro {BLADDER_P_MIN:.2f}-{BLADDER_P_MAX:.2f} bar)."
+            f"Inflation active, setpoint {self.bladder_target:.2f} bar "
+            f"(safe range {BLADDER_P_MIN:.2f}-{BLADDER_P_MAX:.2f} bar)."
         )
 
     def _cmd_deflate_bladder(self, params):
@@ -2301,9 +2301,9 @@ class TBMController:
         self.bladder_target = 0.0
         self._grip_timer = 0.0
         if was_mining:
-            self._set_state(State.READY, "vejiga despresurizada por el operador")
-            return True, "Vejiga despresurizada; excavacion suspendida y maquina en READY."
-        return True, "Vejiga despresurizada."
+            self._set_state(State.READY, "bladder depressurized by the operator")
+            return True, "Bladder depressurized; mining suspended and machine in READY."
+        return True, "Bladder depressurized."
 
     # --- Simulacion de fallas y latido ---------------------------------
 
@@ -2312,44 +2312,44 @@ class TBMController:
 
         if raw in ("generic", "critical"):
             if self.state in (State.POWER_OFF, State.E_STOPPED):
-                return False, f"No hay actuacion que abortar en {self.state.value}."
-            reason = str(params.get("reason", "falla critica simulada por el operador"))
-            log_interlock(f"Falla critica generica inyectada: {reason}")
+                return False, f"No actuation to abort in {self.state.value}."
+            reason = str(params.get("reason", "critical fault simulated by the operator"))
+            log_interlock(f"Generic critical fault injected: {reason}")
             self._set_state(State.FAULT, reason)
-            return True, "Maquina en FAULT. Use 'clear_fault' + 'arm' para recuperarla."
+            return True, "Machine in FAULT. Use 'clear_fault' + 'arm' to recover."
 
         if not isinstance(self._hw, IFaultInjectionPort):
             return False, (
-                f"El adaptador {self.adapter_name} no admite inyeccion de fallas "
-                "(solo hardware simulado)."
+                f"Adapter {self.adapter_name} does not support fault injection "
+                "(simulated hardware only)."
             )
         return self._hw.inject_fault(raw, params)
 
     def _cmd_heartbeat(self, params):
-        return True, "Latido recibido; watchdog de comunicaciones refrescado."
+        return True, "Heartbeat received; communications watchdog refreshed."
 
     def _cmd_set_bladder_sensor(self, params):
         """Ajusta bateria/señal del sensor inalambrico para pruebas de filtros."""
         if not isinstance(self._hw, IFaultInjectionPort):
-            return False, f"El adaptador {self.adapter_name} no admite este comando."
+            return False, f"Adapter {self.adapter_name} does not support this command."
         return self._hw.set_wireless_sensor(params)
 
     def _cmd_hardware_estop(self, params):
         """Simula presionar/liberar el hongo de emergencia FISICO."""
         if not isinstance(self._hw, IFaultInjectionPort):
-            return False, f"El adaptador {self.adapter_name} no admite este comando."
+            return False, f"Adapter {self.adapter_name} does not support this command."
         pressed = bool(params.get("pressed", True))
         self._hw.set_hardware_estop(pressed)
         self._hw_estop_now = self._hardware_estop_pressed()
         self._handle_hardware_estop()
         if pressed:
             return True, (
-                "Hongo FISICO presionado: E-STOPPED inmediato. Libere el hongo y luego "
-                "ejecute 'reset_estop' + 'arm'."
+                "PHYSICAL E-stop button pressed: immediate E-STOPPED. Release the button, then "
+                "run 'reset_estop' + 'arm'."
             )
         return True, (
-            "Hongo FISICO liberado. La maquina sigue en E-STOPPED hasta completar "
-            "'reset_estop' + 'arm'."
+            "PHYSICAL E-stop button released. The machine stays in E-STOPPED until "
+            "'reset_estop' + 'arm' is completed."
         )
 
 
@@ -2370,30 +2370,30 @@ TBC_ROOT_KEYS = (
 )
 
 COMMAND_HELP = {
-    "power_on": "Aplica la energia principal. Paso 1/2 del reinicio seguro desde POWER OFF.",
-    "power_off": "Corta la energia y detiene toda la actuacion. Lleva a POWER OFF.",
-    "estop": "Parada de emergencia inmediata. Params opcionales: {'reason': texto}.",
-    "reset_estop": "Libera el hongo de emergencia. Paso 1/2 del reinicio desde E-STOPPED.",
-    "clear_fault": "Resetea los interlocks enganchados. Paso 1/2 del reinicio desde FAULT.",
-    "arm": "Confirma el rearme. Paso 2/2 obligatorio de todo reinicio seguro; lleva a IDLE.",
-    "set_state": "Solicita un cambio de estado. Params: {'state': 'IDLE|READY|MINING|...'}.",
-    "start_cutterhead": "Arranca el cabezal de corte. Params opcionales: {'rpm': 3.5}.",
-    "stop_cutterhead": "Detiene el cabezal de corte (y suspende la excavacion).",
-    "set_cutterhead_rpm": "Ajusta la consigna de giro. Params: {'rpm': 0-8}.",
-    "steer": "Mueve los motores de direccion. Params: {'motor': 'A|B|both', "
-             "'position_mm': -25..25} o {'delta_mm': x}.",
-    "center_steering": "Devuelve los motores de direccion A y B al centro.",
-    "set_propulsion_speed": "Consigna de avance de las orugas. Params: {'speed_mm_min': 0-60}.",
-    "inflate_bladder": "Presuriza la vejiga de propulsion. Params: {'target_bar': 0-2.6}.",
-    "deflate_bladder": "Despresuriza la vejiga (suspende la excavacion).",
-    "simulate_fault": "Inyecta una falla para probar alarmas. Params: {'fault': "
+    "power_on": "Applies main power. Step 1/2 of the Safe Restart from POWER OFF.",
+    "power_off": "Cuts power and stops all actuation. Leads to POWER OFF.",
+    "estop": "Immediate emergency stop. Optional params: {'reason': text}.",
+    "reset_estop": "Releases the E-stop button. Step 1/2 of the restart from E-STOPPED.",
+    "clear_fault": "Resets the latched interlocks. Step 1/2 of the restart from FAULT.",
+    "arm": "Confirms the re-arm. Mandatory step 2/2 of every Safe Restart; leads to IDLE.",
+    "set_state": "Requests a state change. Params: {'state': 'IDLE|READY|MINING|...'}.",
+    "start_cutterhead": "Starts the cutterhead. Optional params: {'rpm': 3.5}.",
+    "stop_cutterhead": "Stops the cutterhead (and suspends mining).",
+    "set_cutterhead_rpm": "Sets the rotation setpoint. Params: {'rpm': 0-8}.",
+    "steer": "Moves the steering motors. Params: {'motor': 'A|B|both', "
+             "'position_mm': -25..25} or {'delta_mm': x}.",
+    "center_steering": "Returns steering motors A and B to center.",
+    "set_propulsion_speed": "Track advance setpoint. Params: {'speed_mm_min': 0-60}.",
+    "inflate_bladder": "Pressurizes the propulsion bladder. Params: {'target_bar': 0-2.6}.",
+    "deflate_bladder": "Depressurizes the bladder (suspends mining).",
+    "simulate_fault": "Injects a fault to test alarms. Params: {'fault': "
                       "'cutterhead_overload|propulsion_overload|bladder_underpressure|"
                       "bladder_overpressure|comms_loss|bladder_sensor|"
                       "bladder_sensor_battery|bladder_sensor_signal|hardware_estop|generic'}.",
-    "heartbeat": "Refresca el watchdog de comunicaciones sin alterar la maquina.",
-    "set_bladder_sensor": "Ajusta el sensor inalambrico. Params: {'battery_percent': 0-100, "
+    "heartbeat": "Refreshes the communications watchdog without altering the machine.",
+    "set_bladder_sensor": "Adjusts the wireless sensor. Params: {'battery_percent': 0-100, "
                           "'signal_ms': n, 'link_ok': true|false}.",
-    "hardware_estop": "Simula el hongo de emergencia FISICO. Params: {'pressed': true|false}.",
+    "hardware_estop": "Simulates the PHYSICAL E-stop button. Params: {'pressed': true|false}.",
 }
 
 
@@ -2591,19 +2591,19 @@ class TelemetryPresenter:
                 "ports": "IHardwareAdapter (read_sensors, write_actuators, "
                          "check_network_health, is_hardware_estop_triggered)",
                 "adapters": "SimulatedHardwareAdapter",
-                "core": "TBMController (lazo de control no bloqueante a 10 Hz)",
+                "core": "TBMController (non-blocking 10 Hz control loop)",
                 "presentation": "aiohttp + cliente POST hacia TBC",
             },
             "endpoints": {
-                "GET /": "Esta ayuda.",
-                "GET /health": "Resumen corto de estado y seguridad.",
-                "GET /telemetry": "Telemetria completa en el formato exigido por TBC (sample a 10 Hz).",
-                "POST /command": "Modo manual/ingenieria: {'command': nombre, 'params': {...}}.",
-                "POST /tbc_endpoint": "Receptor simulado de telemetria de The Boring Company.",
-                "POST /api/plc/parada": "Parada de emergencia HMI/PLC (alias /api/plc/estop). "
-                                        "Payload {'source': 'HMI_Operator'}. Fuerza E-STOPPED sin "
-                                        "validar transiciones, aun con payload invalido, y responde "
-                                        "200 {ok, message, state, command}. Salir exige 'reset_estop' "
+                "GET /": "This help.",
+                "GET /health": "Short status and safety summary.",
+                "GET /telemetry": "Full telemetry in the format required by TBC (10 Hz sample).",
+                "POST /command": "Manual/engineering mode: {'command': name, 'params': {...}}.",
+                "POST /tbc_endpoint": "Simulated telemetry receiver for The Boring Company.",
+                "POST /api/plc/parada": "HMI/PLC emergency stop (alias /api/plc/estop). "
+                                        "Payload {'source': 'HMI_Operator'}. Forces E-STOPPED without "
+                                        "validating transitions, even with an invalid payload, and responds "
+                                        "200 {ok, message, state, command}. Leaving requires 'reset_estop' "
                                         "+ 'arm'.",
             },
             "states": [state.value for state in State],
@@ -2619,21 +2619,21 @@ class TelemetryPresenter:
                 for state, sequence in RESTART_SEQUENCES.items()
             },
             "interlocks": {
-                "cutterhead_overload": f"Carga > {CUTTERHEAD_LOAD_MAX_PCT:.0f} % o corriente > "
-                                       f"{CUTTERHEAD_CURRENT_MAX_A:.0f} A durante "
-                                       f"{OVERLOAD_DEBOUNCE_S:.1f} s: detiene cabezal y propulsion (FAULT).",
-                "propulsion_overload": f"Carga > {PROPULSION_LOAD_MAX_PCT:.0f} % o corriente > "
-                                       f"{PROPULSION_CURRENT_MAX_A:.0f} A durante "
-                                       f"{OVERLOAD_DEBOUNCE_S:.1f} s: detiene la propulsion.",
-                "bladder_underpressure": f"P_vejiga < {BLADDER_P_MIN:.2f} bar: deshabilita la propulsion.",
-                "bladder_overpressure": f"P_vejiga > {BLADDER_P_MAX:.2f} bar: detiene el inflado, "
-                                        "abre el alivio y deshabilita la propulsion (FAULT).",
-                "comms_loss": "Watchdog: un enlace armado (red del hardware, estacion del operador en "
-                              "READY/MINING, enlace TBC) sin señales de vida durante mas de "
-                              f"{WATCHDOG_TIMEOUT_S:.0f} s: aborto global (FAULT).",
+                "cutterhead_overload": f"Load > {CUTTERHEAD_LOAD_MAX_PCT:.0f} % or current > "
+                                       f"{CUTTERHEAD_CURRENT_MAX_A:.0f} A for "
+                                       f"{OVERLOAD_DEBOUNCE_S:.1f} s: stops cutterhead and propulsion (FAULT).",
+                "propulsion_overload": f"Load > {PROPULSION_LOAD_MAX_PCT:.0f} % or current > "
+                                       f"{PROPULSION_CURRENT_MAX_A:.0f} A for "
+                                       f"{OVERLOAD_DEBOUNCE_S:.1f} s: stops propulsion.",
+                "bladder_underpressure": f"P_bladder < {BLADDER_P_MIN:.2f} bar: disables propulsion.",
+                "bladder_overpressure": f"P_bladder > {BLADDER_P_MAX:.2f} bar: stops inflation, "
+                                        "opens the relief valve and disables propulsion (FAULT).",
+                "comms_loss": "Watchdog: an armed link (hardware network, operator station in "
+                              "READY/MINING, TBC link) with no sign of life for more than "
+                              f"{WATCHDOG_TIMEOUT_S:.0f} s: global abort (FAULT).",
                 "bladder_sensor": (
-                    f"Bateria del sensor inalambrico <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} % "
-                    f"o señal >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms: maquina a FAULT."
+                    f"Wireless sensor battery <= {BLADDER_SENSOR_BATTERY_CRITICAL_PCT:.0f} % "
+                    f"or signal >= {BLADDER_SENSOR_SIGNAL_LOST_MS:.0f} ms: machine to FAULT."
                 ),
             },
             "commands": COMMAND_HELP,
@@ -2677,14 +2677,14 @@ async def read_json_body(request, required=True):
     raw = await request.read()
     if not raw.strip():
         if required:
-            return None, "Cuerpo vacio: se espera un objeto JSON."
+            return None, "Empty body: a JSON object is expected."
         return {}, None
     try:
         body = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        return None, f"JSON invalido: {exc}"
+        return None, f"Invalid JSON: {exc}"
     if not isinstance(body, dict):
-        return None, "El JSON debe ser un objeto, por ejemplo {\"command\": \"arm\"}."
+        return None, "The JSON must be an object, for example {\"command\": \"arm\"}."
     return body, None
 
 
@@ -2715,17 +2715,17 @@ if web is not None:
             if exc.status == 404:
                 response = json_response({
                     "ok": False,
-                    "error": f"Ruta no encontrada: {request.path_qs}",
-                    "hint": "Use GET /telemetry, GET / o POST /command.",
+                    "error": f"Route not found: {request.path_qs}",
+                    "hint": "Use GET /telemetry, GET / or POST /command.",
                 }, 404)
             else:
                 response = json_response(
-                    {"ok": False, "error": exc.reason or "Error HTTP"}, exc.status
+                    {"ok": False, "error": exc.reason or "HTTP error"}, exc.status
                 )
         except Exception as exc:                    # nunca tumbar el servidor
-            log_warn(f"Error interno en {request.method} {request.path}: {exc!r}")
+            log_warn(f"Internal error in {request.method} {request.path}: {exc!r}")
             response = json_response(
-                {"ok": False, "error": "Error interno del servidor."}, 500
+                {"ok": False, "error": "Internal server error."}, 500
             )
         response.headers.update(CORS_HEADERS)
         return response
@@ -2752,7 +2752,7 @@ class TelemetryApi:
     async def command(self, request):
         body, error = await read_json_body(request)
         if error:
-            log_warn(f"POST /command rechazado: {error}")
+            log_warn(f"POST /command rejected: {error}")
             return json_response(
                 {"ok": False, "error": error, "commands": sorted(COMMAND_HELP)}, 400
             )
@@ -2760,7 +2760,7 @@ class TelemetryApi:
         if command is None:
             return json_response({
                 "ok": False,
-                "error": "Falta la llave 'command'.",
+                "error": "Missing key 'command'.",
                 "example": {"command": "set_state", "params": {"state": "READY"}},
                 "commands": sorted(COMMAND_HELP),
             }, 400)
@@ -2784,11 +2784,11 @@ class TelemetryApi:
         self.tbc_packets += 1
         missing = [key for key in TBC_ROOT_KEYS if key not in body]
         if missing:
-            log_warn(f"Paquete TBC #{self.tbc_packets} incompleto, faltan: {', '.join(missing)}")
+            log_warn(f"TBC packet #{self.tbc_packets} incomplete, missing: {', '.join(missing)}")
         elif self.tbc_packets == 1 or self.tbc_packets % 10 == 0:
             log_net(
-                f"📦 Paquete de telemetria #{self.tbc_packets} recibido por el receptor TBC "
-                f"simulado (team={body.get('team')}, chainage={body.get('chainage')}, "
+                f"📦 Telemetry packet #{self.tbc_packets} received by the simulated TBC "
+                f"receiver (team={body.get('team')}, chainage={body.get('chainage')}, "
                 f"mining={body.get('mining')})."
             )
         return json_response({"status": "success", "message": "Telemetry received by TBC"})
@@ -2814,8 +2814,8 @@ class TelemetryApi:
             body, error = None, repr(exc)
         if error:
             log_warn(
-                f"POST /api/plc/parada con payload invalido ({error}); "
-                "la parada de emergencia se ejecuta igualmente."
+                f"POST /api/plc/parada with invalid payload ({error}); "
+                "the emergency stop is executed anyway."
             )
             return ESTOP_SOURCE_DEFAULT
         return sanitize_source(body.get("source", body.get("origin", ESTOP_SOURCE_DEFAULT)))
@@ -2856,7 +2856,7 @@ class TBCUplinkClient:
     def __init__(self, controller, presenter, url, hz, token=None):
         if hz < self.MIN_HZ:
             raise ValueError(
-                f"El uplink no puede ser mas lento que {self.MIN_HZ} Hz (requisito TBC)."
+                f"The uplink cannot be slower than {self.MIN_HZ} Hz (TBC requirement)."
             )
         self._controller = controller
         self._presenter = presenter
@@ -2867,8 +2867,8 @@ class TBCUplinkClient:
 
     async def run(self):
         log_net(
-            f"Cliente TBC activo -> {self.url} a {self.hz:g} Hz "
-            f"(cada {self.period_s:.1f} s; minimo TBC {self.MIN_HZ} Hz)."
+            f"TBC client active -> {self.url} at {self.hz:g} Hz "
+            f"(every {self.period_s:.1f} s; TBC minimum {self.MIN_HZ} Hz)."
         )
         headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
         timeout = aiohttp.ClientTimeout(total=min(self.REQUEST_TIMEOUT_S, 0.8 * self.period_s))
@@ -2902,69 +2902,69 @@ def print_banner(args, controller, uplink_url):
     print("=" * 72)
     print(f"🚀  B.I.C.H.O. SUPERVISORY CONTROLLER  v{VERSION}   |   {TEAM_NAME}")
     print("=" * 72)
-    print("🏗️   Arquitectura: Puertos -> Adaptadores -> Nucleo -> API (aiohttp)")
-    print(f"🔌  Hardware inyectado ...... {controller.adapter_name}")
-    print(f"🌐  Escuchando en {shown_host}:{args.port}   (lazo y telemetria a {TICK_HZ:.0f} Hz)")
-    print(f"📡  Telemetria .............. GET  {base}/telemetry")
-    print(f"🎛️   Modo manual/ingenieria .. POST {base}/command")
-    print(f"🛑  Receptor TBC simulado ... POST {base}/tbc_endpoint")
-    print(f"🚨  Parada emergencia HMI ... POST {base}/api/plc/parada  {{\"source\": \"HMI_Operator\"}}")
-    print(f"📖  Ayuda de la API ......... GET  {base}/")
-    print(f"🐕  Watchdog de red ......... {controller.watchdog_timeout_s:.0f} s sin vida => FAULT")
+    print("🏗️   Architecture: Ports -> Adapters -> Core -> API (aiohttp)")
+    print(f"🔌  Injected hardware ....... {controller.adapter_name}")
+    print(f"🌐  Listening on {shown_host}:{args.port}   (loop and telemetry at {TICK_HZ:.0f} Hz)")
+    print(f"📡  Telemetry ............... GET  {base}/telemetry")
+    print(f"🎛️   Manual/engineering mode . POST {base}/command")
+    print(f"🛑  Simulated TBC receiver .. POST {base}/tbc_endpoint")
+    print(f"🚨  HMI emergency stop ...... POST {base}/api/plc/parada  {{\"source\": \"HMI_Operator\"}}")
+    print(f"📖  API help ................ GET  {base}/")
+    print(f"🐕  Network watchdog ........ {controller.watchdog_timeout_s:.0f} s without sign of life => FAULT")
     if uplink_url:
-        print(f"⬆️   Cliente TBC ............. POST {uplink_url} a {args.uplink_hz:g} Hz")
+        print(f"⬆️   TBC client .............. POST {uplink_url} at {args.uplink_hz:g} Hz")
     else:
-        print("⚠️   Cliente TBC DESACTIVADO (--no-uplink): incumple la Regla 7 de TBC.")
+        print("⚠️   TBC client DISABLED (--no-uplink): violates TBC Rule 7.")
     print("-" * 72)
-    print(f"🔐  Estado inicial: {controller.state.value}")
-    print("    Secuencia de puesta en marcha (cada paso es un POST /command):")
+    print(f"🔐  Initial state: {controller.state.value}")
+    print("    Start-up sequence (each step is a POST /command):")
     print("      1) power_on          2) arm                 -> IDLE")
-    print("      3) set_state READY   4) inflate_bladder     -> vejiga con agarre")
-    print("      5) start_cutterhead  6) set_state MINING    -> excavando")
-    print("    Reinicio seguro: E-STOPPED / POWER OFF / FAULT exigen 2 acciones.")
+    print("      3) set_state READY   4) inflate_bladder     -> bladder gripping")
+    print("      5) start_cutterhead  6) set_state MINING    -> mining")
+    print("    Safe Restart: E-STOPPED / POWER OFF / FAULT require 2 actions.")
     print("-" * 72)
-    print("    Ejemplo (PowerShell):")
+    print("    Example (PowerShell):")
     print(f"      Invoke-RestMethod {base}/command -Method Post "
           "-ContentType 'application/json' -Body '{\"command\":\"power_on\"}'")
-    print("    Ejemplo (curl):")
+    print("    Example (curl):")
     print(f"      curl -X POST {base}/command -H \"Content-Type: application/json\" "
           "-d \"{\\\"command\\\":\\\"estop\\\"}\"")
     print("-" * 72)
-    print("⚠️   Ctrl+C para apagar el controlador.")
+    print("⚠️   Press Ctrl+C to shut down the controller.")
     print("=" * 72, flush=True)
 
 
 def parse_args(argv=None):
     parser = argparse.ArgumentParser(
-        description="Controlador supervisor / gemelo digital del B.I.C.H.O. - UDD Tunnel Lab."
+        description="B.I.C.H.O. supervisory controller / digital twin - UDD Tunnel Lab."
     )
-    parser.add_argument("--host", default="", help="Interfaz de escucha (por defecto: todas).")
-    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="Puerto HTTP.")
+    parser.add_argument("--host", default="", help="Listening interface (default: all).")
+    parser.add_argument("--port", type=int, default=DEFAULT_PORT, help="HTTP port.")
     parser.add_argument(
         "--start-state",
         default="POWER OFF",
-        help="Estado inicial (POWER OFF por defecto; use IDLE para desarrollo de GUI).",
+        help="Initial state (POWER OFF by default; use IDLE for GUI development).",
     )
     parser.add_argument(
         "--comms-timeout",
         type=float,
         default=WATCHDOG_TIMEOUT_S,
-        help="Segundos sin vida de un enlace armado antes del aborto global (def. 10).",
+        help="Seconds without sign of life on an armed link before global abort (def. 10).",
     )
     parser.add_argument(
         "--uplink-url", default=None,
-        help="URL del servidor TBC (por defecto: receptor simulado local /tbc_endpoint).",
+        help="TBC server URL (default: local simulated receiver /tbc_endpoint).",
     )
     parser.add_argument(
         "--uplink-hz", type=float, default=1.0,
-        help="Frecuencia del POST a TBC en Hz (por defecto 1; minimo TBC 0.1).",
+        help="POST frequency to TBC in Hz (default 1; TBC minimum 0.1).",
     )
-    parser.add_argument("--uplink-token", default=None, help="Bearer token para el uplink.")
+    parser.add_argument("--uplink-token", default=None, help="Bearer token for the uplink.")
     parser.add_argument(
         "--no-uplink", action="store_true",
-        help="Desactiva el cliente TBC (solo desarrollo: incumple la Regla 7).",
+        help="Disables the TBC client (development only: violates Rule 7).",
     )
-    parser.add_argument("--seed", type=int, default=None, help="Semilla del ruido simulado.")
+    parser.add_argument("--seed", type=int, default=None, help="Simulated noise seed.")
     return parser.parse_args(argv)
 
 
@@ -2973,7 +2973,7 @@ def _report_task_failure(task):
         return
     exc = task.exception()
     if exc is not None:
-        log_warn(f"La tarea '{task.get_name()}' termino con error: {exc!r}")
+        log_warn(f"Task '{task.get_name()}' terminated with error: {exc!r}")
 
 
 async def serve(args, start_state):
@@ -2997,7 +2997,7 @@ async def serve(args, start_state):
         await site.start()
     except OSError as exc:
         await runner.cleanup()
-        print(f"No se pudo abrir el puerto {args.port}: {exc}")
+        print(f"Could not open port {args.port}: {exc}")
         return 1
 
     uplink_url = None
@@ -3018,7 +3018,7 @@ async def serve(args, start_state):
         await asyncio.Event().wait()           # hasta Ctrl+C
     except asyncio.CancelledError:
         print()
-        log_info("Apagado solicitado por el operador (Ctrl+C).")
+        log_info("Shutdown requested by the operator (Ctrl+C).")
         raise
     finally:
         for task in tasks:
@@ -3027,12 +3027,12 @@ async def serve(args, start_state):
         await runner.cleanup()
         snap = controller.snapshot()
         log_info(
-            f"Resumen final: estado={snap.state.value}, "
+            f"Final summary: state={snap.state.value}, "
             f"chainage={snap.sensors['chainage_odometry_m']:.3f} m, "
-            f"comandos={snap.commands_received}, "
-            f"tiempo excavando={snap.mining_time_s:.1f} s."
+            f"commands={snap.commands_received}, "
+            f"mining time={snap.mining_time_s:.1f} s."
         )
-        print("🛑 Controlador B.I.C.H.O. detenido.")
+        print("🛑 B.I.C.H.O. controller stopped.")
     return 0
 
 
@@ -3041,25 +3041,25 @@ def main(argv=None):
     args = parse_args(argv)
 
     if aiohttp is None:
-        print("Falta la dependencia 'aiohttp'. Instalela con:\n"
+        print("Missing dependency 'aiohttp'. Install it with:\n"
               "    pip install -r requirements.txt")
         return 3
 
     start_state = parse_state(args.start_state)
     if start_state is None:
-        print(f"Estado inicial invalido: '{args.start_state}'. "
-              f"Validos: {', '.join(s.value for s in State)}")
+        print(f"Invalid initial state: '{args.start_state}'. "
+              f"Valid: {', '.join(s.value for s in State)}")
         return 2
     if start_state in (State.MINING, State.FAULT, State.E_STOPPED):
-        print(f"El estado inicial no puede ser {start_state.value}: la maquina debe "
-              "arrancar en POWER OFF, IDLE o READY.")
+        print(f"The initial state cannot be {start_state.value}: the machine must "
+              "start in POWER OFF, IDLE or READY.")
         return 2
     if not args.no_uplink and args.uplink_hz < TBCUplinkClient.MIN_HZ:
-        print(f"El uplink no puede ser mas lento que {TBCUplinkClient.MIN_HZ} Hz "
-              "(requisito TBC).")
+        print(f"The uplink cannot be slower than {TBCUplinkClient.MIN_HZ} Hz "
+              "(TBC requirement).")
         return 2
     if args.comms_timeout <= 0.0:
-        print("--comms-timeout debe ser mayor que 0.")
+        print("--comms-timeout must be greater than 0.")
         return 2
 
     try:
